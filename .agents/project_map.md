@@ -55,10 +55,11 @@ Edge_AI_CCTV/
 │   │   ├── config.py                         # Settings, retention policies, Coturn keys, kinematics thresholds
 │   │   ├── database.py                       # SQLAlchemy async SQLite session factory (aiosqlite)
 │   │   ├── models/
-│   │   │   ├── schemas.py                    # Pydantic schemas (events, zones, DVR, timeline, telemetry)
-│   │   │   └── db_models.py                  # SQLAlchemy ORM models (cameras, events, dvr_segments, archives)
+│   │   │   ├── schemas.py                    # Pydantic schemas (events, zones, DVR, timeline, telemetry, setup)
+│   │   │   └── db_models.py                  # SQLAlchemy ORM models (cameras, events, admin_users, system_setup)
 │   │   ├── routes/
 │   │   │   ├── health.py                     # Hardware & telemetry monitoring endpoint (/api/v1/health)
+│   │   │   ├── setup.py                      # First-time setup wizard & auth pairing API (/api/v1/setup, /api/v1/auth)
 │   │   │   ├── cameras.py                    # Camera CRUD, snapshot routes, device token registration
 │   │   │   ├── events.py                     # AI event ingestion, SQLite persistence, clip streaming
 │   │   │   ├── webrtc.py                     # WebRTC SDP offer/answer exchange & dynamic ICE servers
@@ -111,6 +112,9 @@ Edge_AI_CCTV/
         │   └── zone_canvas_painter.dart      # Interactive canvas painter for visual polygon/tripwire drawing
         └── screens/
             ├── app_shell.dart                # Master adaptive responsive AppShell (Mobile, Tablet, PC/Web)
+            ├── login_screen.dart             # Multi-mode Login (Biometrics, PIN, QR Scan, Password)
+            ├── setup_wizard_screen.dart      # 6-step First-Time Setup Wizard (Hardware, RTSP Scan, Admin)
+            ├── settings_screen.dart          # System Settings & Hardware Telemetry Dashboard
             ├── multi_cam_grid_screen.dart    # Adaptive 1 to 16 camera live grid wall
             ├── live_view_screen.dart         # Fullscreen WebRTC live player with talkback & 24h timeline
             ├── dvr_playback_screen.dart      # 24/7 continuous DVR timeline player
