@@ -105,48 +105,62 @@ class PrivacyMaskEngine:
         if not self.masks or frame is None:
             return frame
 
-        h, w = frame.shape[:2]
-        output_frame = frame.copy()
+        start_t = time.time()
+        try:
+            h, w = frame.shape[:2]
+            output_frame = frame.copy()
 
-        for mask_cfg in self.masks:
-            if not mask_cfg.polygon_points or len(mask_cfg.polygon_points) < 3:
-                continue
+            for mask_cfg in self.masks:
+                if not mask_cfg.polygon_points or len(mask_cfg.polygon_points) < 3:
+                    continue
+                
+                # Validate and clamp coordinates
+                valid_pts = []
+                for p in mask_cfg.polygon_points:
+                    px = max(0.0, min(1.0, float(p.x)))
+                    py = max(0.0, min(1.0, float(p.y)))
+                    valid_pts.append([int(px * w), int(py * h)])
+                
+                if len(valid_pts) < 3:
+                    continue
 
-            pts = np.array(
-                [[int(p.x * w), int(p.y * h)] for p in mask_cfg.polygon_points],
-                dtype=np.int32
-            )
+                pts = np.array(valid_pts, dtype=np.int32)
 
-            if mask_cfg.mask_mode == MaskMode.BLACKOUT:
-                cv2.fillPoly(output_frame, [pts], (0, 0, 0))
+                if mask_cfg.mask_mode == MaskMode.BLACKOUT:
+                    cv2.fillPoly(output_frame, [pts], (0, 0, 0))
 
-            elif mask_cfg.mask_mode == MaskMode.COLOR:
-                cv2.fillPoly(output_frame, [pts], mask_cfg.mask_color_bgr)
+                elif mask_cfg.mask_mode == MaskMode.COLOR:
+                    cv2.fillPoly(output_frame, [pts], mask_cfg.mask_color_bgr)
 
-            elif mask_cfg.mask_mode == MaskMode.BLUR:
-                poly_mask = np.zeros((h, w), dtype=np.uint8)
-                cv2.fillPoly(poly_mask, [pts], 255)
-                k = mask_cfg.blur_kernel_size | 1
-                blurred = cv2.GaussianBlur(output_frame, (k, k), 0)
-                output_frame[poly_mask == 255] = blurred[poly_mask == 255]
+                elif mask_cfg.mask_mode == MaskMode.BLUR:
+                    poly_mask = np.zeros((h, w), dtype=np.uint8)
+                    cv2.fillPoly(poly_mask, [pts], 255)
+                    k = mask_cfg.blur_kernel_size | 1
+                    blurred = cv2.GaussianBlur(output_frame, (k, k), 0)
+                    output_frame[poly_mask == 255] = blurred[poly_mask == 255]
 
-            elif mask_cfg.mask_mode == MaskMode.MOSAIC:
-                rx, ry, rw, rh = cv2.boundingRect(pts)
-                if rw > 0 and rh > 0:
-                    poly_mask = np.zeros((rh, rw), dtype=np.uint8)
-                    pts_shifted = pts - np.array([rx, ry])
-                    cv2.fillPoly(poly_mask, [pts_shifted], 255)
+                elif mask_cfg.mask_mode == MaskMode.MOSAIC:
+                    rx, ry, rw, rh = cv2.boundingRect(pts)
+                    if rw > 0 and rh > 0:
+                        poly_mask = np.zeros((rh, rw), dtype=np.uint8)
+                        pts_shifted = pts - np.array([rx, ry])
+                        cv2.fillPoly(poly_mask, [pts_shifted], 255)
 
-                    roi = output_frame[ry:ry + rh, rx:rx + rw]
-                    scale = max(2, mask_cfg.mosaic_scale)
-                    small_w, small_h = max(1, rw // scale), max(1, rh // scale)
-                    small_roi = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
-                    pixelated = cv2.resize(small_roi, (rw, rh), interpolation=cv2.INTER_NEAREST)
+                        roi = output_frame[ry:ry + rh, rx:rx + rw]
+                        scale = max(2, mask_cfg.mosaic_scale)
+                        small_w, small_h = max(1, rw // scale), max(1, rh // scale)
+                        small_roi = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+                        pixelated = cv2.resize(small_roi, (rw, rh), interpolation=cv2.INTER_NEAREST)
 
-                    roi[poly_mask == 255] = pixelated[poly_mask == 255]
-                    output_frame[ry:ry + rh, rx:rx + rw] = roi
+                        roi[poly_mask == 255] = pixelated[poly_mask == 255]
+                        output_frame[ry:ry + rh, rx:rx + rw] = roi
 
-        return output_frame
+            latency = (time.time() - start_t) * 1000
+            logger.debug(f"[AIZoneService] Privacy mask applied in {latency:.2f}ms, count={len(self.masks)}")
+            return output_frame
+        except Exception as e:
+            logger.error(f"[AIZoneService] Error applying privacy mask for camera {self.camera_id}: {e}", exc_info=True)
+            return frame
 
 
 # ---------------- 3. Spatial Zone & Tripwire Tracker ----------------
@@ -179,99 +193,119 @@ class ZoneAnalyticsTracker:
     ) -> List[SecurityEventCreate]:
         events: List[SecurityEventCreate] = []
         now = time.time()
+        start_t = now
 
-        if now - self.last_cleanup > 5.0:
-            stale_ids = [tid for tid, t in self.tracks.items() if (now - t.last_seen) > 10.0]
-            for tid in stale_ids:
-                del self.tracks[tid]
-            self.last_cleanup = now
+        try:
+            if now - self.last_cleanup > 5.0:
+                stale_ids = [tid for tid, t in self.tracks.items() if (now - t.last_seen) > 10.0]
+                for tid in stale_ids:
+                    del self.tracks[tid]
+                self.last_cleanup = now
 
-        for track_id, bbox in detections:
-            curr_pos = PolygonGeometry.get_bbox_footprint(bbox)
-
-            if track_id not in self.tracks:
-                self.tracks[track_id] = TrackSpatialState(
-                    track_id=track_id,
-                    label=bbox.label,
-                    last_position=curr_pos,
-                    last_seen=now
-                )
-                prev_pos = curr_pos
-            else:
-                prev_pos = self.tracks[track_id].last_position
-                self.tracks[track_id].last_position = curr_pos
-                self.tracks[track_id].last_seen = now
-
-            track_state = self.tracks[track_id]
-
-            # 1. Evaluate Tripwires
-            for zone_id, zone in self.zones.items():
-                if zone.zone_type != ZoneType.TRIPWIRE or not zone.line_start or not zone.line_end:
+            for track_id, bbox in detections:
+                try:
+                    curr_pos = PolygonGeometry.get_bbox_footprint(bbox)
+                except Exception as e:
+                    logger.warning(f"Failed to get footprint for track {track_id}: {e}")
                     continue
 
-                w_start = (zone.line_start.x, zone.line_start.y)
-                w_end = (zone.line_end.x, zone.line_end.y)
-                crossing = PolygonGeometry.check_line_crossing(prev_pos, curr_pos, w_start, w_end)
-
-                if crossing:
-                    is_valid_dir = (
-                        zone.direction == TripwireDirection.BIDIRECTIONAL or
-                        zone.direction == crossing
+                if track_id not in self.tracks:
+                    self.tracks[track_id] = TrackSpatialState(
+                        track_id=track_id,
+                        label=bbox.label,
+                        last_position=curr_pos,
+                        last_seen=now
                     )
-                    last_alert = track_state.last_tripwire_alerts.get(zone_id, 0.0)
-                    if is_valid_dir and (now - last_alert > 3.0):
-                        track_state.last_tripwire_alerts[zone_id] = now
-                        events.append(
-                            SecurityEventCreate(
-                                camera_id=self.camera_id,
-                                event_type=EventType.INTRUSION_DETECTED,
-                                severity=EventSeverity.CRITICAL,
-                                confidence=bbox.confidence,
-                                bounding_box=bbox,
-                                metadata={
-                                    "zone_id": zone.id,
-                                    "zone_name": zone.name,
-                                    "analytics_type": "TRIPWIRE_LINE_CROSSING",
-                                    "direction": crossing.value,
-                                    "track_id": track_id
-                                }
-                            )
-                        )
-
-            # 2. Evaluate Polygon Intrusion & Loitering Zones
-            for zone_id, zone in self.zones.items():
-                if zone.zone_type != ZoneType.INTRUSION or not zone.polygon_points:
-                    continue
-
-                poly = [(p.x, p.y) for p in zone.polygon_points]
-                is_inside = PolygonGeometry.point_in_polygon_raycasting(curr_pos, poly)
-
-                if is_inside:
-                    if zone_id not in track_state.entry_timestamps:
-                        track_state.entry_timestamps[zone_id] = now
-
-                    dwell_time = now - track_state.entry_timestamps[zone_id]
-                    if dwell_time >= zone.dwell_time_seconds:
-                        if dwell_time - zone.dwell_time_seconds < 1.0:
-                            events.append(
-                                SecurityEventCreate(
-                                    camera_id=self.camera_id,
-                                    event_type=EventType.INTRUSION_DETECTED,
-                                    severity=EventSeverity.CRITICAL if zone.dwell_time_seconds == 0 else EventSeverity.WARNING,
-                                    confidence=bbox.confidence,
-                                    bounding_box=bbox,
-                                    metadata={
-                                        "zone_id": zone.id,
-                                        "zone_name": zone.name,
-                                        "analytics_type": "POLYGON_INTRUSION",
-                                        "dwell_time_sec": round(dwell_time, 1),
-                                        "track_id": track_id
-                                    }
-                                )
-                            )
+                    prev_pos = curr_pos
                 else:
-                    track_state.entry_timestamps.pop(zone_id, None)
+                    prev_pos = self.tracks[track_id].last_position
+                    self.tracks[track_id].last_position = curr_pos
+                    self.tracks[track_id].last_seen = now
 
+                track_state = self.tracks[track_id]
+
+                # 1. Evaluate Tripwires
+                for zone_id, zone in self.zones.items():
+                    if zone.zone_type != ZoneType.TRIPWIRE or not zone.line_start or not zone.line_end:
+                        continue
+
+                    try:
+                        w_start = (zone.line_start.x, zone.line_start.y)
+                        w_end = (zone.line_end.x, zone.line_end.y)
+                        crossing = PolygonGeometry.check_line_crossing(prev_pos, curr_pos, w_start, w_end)
+
+                        if crossing:
+                            is_valid_dir = (
+                                zone.direction == TripwireDirection.BIDIRECTIONAL or
+                                zone.direction == crossing
+                            )
+                            last_alert = track_state.last_tripwire_alerts.get(zone_id, 0.0)
+                            if is_valid_dir and (now - last_alert > 3.0):
+                                track_state.last_tripwire_alerts[zone_id] = now
+                                events.append(
+                                    SecurityEventCreate(
+                                        camera_id=self.camera_id,
+                                        event_type=EventType.INTRUSION_DETECTED,
+                                        severity=EventSeverity.CRITICAL,
+                                        confidence=bbox.confidence,
+                                        bounding_box=bbox,
+                                        metadata={
+                                            "zone_id": zone.id,
+                                            "zone_name": zone.name,
+                                            "analytics_type": "TRIPWIRE_LINE_CROSSING",
+                                            "direction": crossing.value,
+                                            "track_id": track_id
+                                        }
+                                    )
+                                )
+                    except Exception as e:
+                        logger.error(f"Error evaluating tripwire {zone_id}: {e}")
+                        continue
+
+                # 2. Evaluate Polygon Intrusion & Loitering Zones
+                for zone_id, zone in self.zones.items():
+                    if zone.zone_type != ZoneType.INTRUSION or not zone.polygon_points:
+                        continue
+                    
+                    try:
+                        if len(zone.polygon_points) < 3:
+                            continue
+                        poly = [(p.x, p.y) for p in zone.polygon_points]
+                        is_inside = PolygonGeometry.point_in_polygon_raycasting(curr_pos, poly)
+
+                        if is_inside:
+                            if zone_id not in track_state.entry_timestamps:
+                                track_state.entry_timestamps[zone_id] = now
+
+                            dwell_time = now - track_state.entry_timestamps[zone_id]
+                            if dwell_time >= zone.dwell_time_seconds:
+                                if dwell_time - zone.dwell_time_seconds < 1.0:
+                                    events.append(
+                                        SecurityEventCreate(
+                                            camera_id=self.camera_id,
+                                            event_type=EventType.INTRUSION_DETECTED,
+                                            severity=EventSeverity.CRITICAL if zone.dwell_time_seconds == 0 else EventSeverity.WARNING,
+                                            confidence=bbox.confidence,
+                                            bounding_box=bbox,
+                                            metadata={
+                                                "zone_id": zone.id,
+                                                "zone_name": zone.name,
+                                                "analytics_type": "POLYGON_INTRUSION",
+                                                "dwell_time_sec": round(dwell_time, 1),
+                                                "track_id": track_id
+                                            }
+                                        )
+                                    )
+                        else:
+                            track_state.entry_timestamps.pop(zone_id, None)
+                    except Exception as e:
+                        logger.error(f"Error evaluating polygon intrusion zone {zone_id}: {e}")
+                        continue
+        except Exception as e:
+            logger.error(f"[AIZoneService] Critical error in process_detections: {e}", exc_info=True)
+            
+        latency = (time.time() - start_t) * 1000
+        logger.debug(f"[AIZoneService] Detections processed in {latency:.2f}ms for camera {self.camera_id}, zones={len(self.zones)}, events={len(events)}")
         return events
 
 

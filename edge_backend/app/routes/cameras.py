@@ -15,11 +15,13 @@ from app.services.video_ingest_service import video_ingest_service
 from app.services.notification_service import notification_service
 
 from app.services.auth_service import auth_service, general_rate_limiter
+from app.routes import ResilientRoute
 
 router = APIRouter(
     prefix="/api/v1/cameras",
     tags=["Cameras"],
-    dependencies=[Depends(auth_service.verify_api_access), Depends(general_rate_limiter)]
+    dependencies=[Depends(auth_service.verify_api_access), Depends(general_rate_limiter)],
+    route_class=ResilientRoute
 )
 
 

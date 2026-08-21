@@ -8,9 +8,16 @@ from app.config import settings
 from app.database import async_session_factory
 from app.models.db_models import CameraModel, SecurityEventModel
 from app.services.hailo_inference_service import hailo_inference_service
+from app.routes import ResilientRoute
 
-router = APIRouter(prefix="/api/v1/health", tags=["Health & Telemetry"])
+router = APIRouter(
+    prefix="/api/v1/health", 
+    tags=["Health & Telemetry"],
+    route_class=ResilientRoute
+)
 
+
+from app.services.resilience import ServiceHealthTracker
 
 @router.get("")
 async def health_check():
@@ -30,6 +37,16 @@ async def health_check():
 
     active_tracks = len(hailo_inference_service.kinematic_engine.tracks)
 
+    # Log file info
+    log_path = "storage/logs/edge_cctv.log"
+    log_size_mb = 0
+    if os.path.exists(log_path):
+        log_size_mb = round(os.path.getsize(log_path) / (1024 * 1024), 2)
+
+    # Service Health Tracker Report
+    health_tracker = ServiceHealthTracker()
+    service_report = health_tracker.get_system_health_report()
+
     return {
         "status": "healthy",
         "version": settings.VERSION,
@@ -44,6 +61,11 @@ async def health_check():
             "free_gb": round(free / (1024**3), 2),
             "retention_days": settings.STORAGE_RETENTION_DAYS,
         },
+        "logs": {
+            "path": log_path,
+            "size_mb": log_size_mb,
+        },
+        "services": service_report["services"],
         "telemetry": {
             "total_cameras": cam_count,
             "total_events": event_count,

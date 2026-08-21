@@ -24,11 +24,13 @@ from app.models.schemas import (
 )
 from app.services.dvr_recorder import dvr_recorder_service
 from app.services.auth_service import auth_service, general_rate_limiter
+from app.routes import ResilientRoute
 
 router = APIRouter(
     prefix="/api/v1",
     tags=["DVR & Timeline"],
-    dependencies=[Depends(auth_service.verify_api_access), Depends(general_rate_limiter)]
+    dependencies=[Depends(auth_service.verify_api_access), Depends(general_rate_limiter)],
+    route_class=ResilientRoute
 )
 
 

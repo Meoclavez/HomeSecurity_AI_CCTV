@@ -6,11 +6,13 @@ from app.config import settings
 from app.models.schemas import WebRtcOffer, WebRtcAnswer
 from app.services.auth_service import auth_service, general_rate_limiter
 from app.services.turn_service import turn_service
+from app.routes import ResilientRoute
 
 router = APIRouter(
     prefix="/api/v1/webrtc",
     tags=["WebRTC Signaling"],
-    dependencies=[Depends(auth_service.verify_api_access), Depends(general_rate_limiter)]
+    dependencies=[Depends(auth_service.verify_api_access), Depends(general_rate_limiter)],
+    route_class=ResilientRoute
 )
 
 GO2RTC_API_URL = "http://127.0.0.1:1984"

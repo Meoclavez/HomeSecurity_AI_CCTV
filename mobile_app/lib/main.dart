@@ -6,6 +6,7 @@ import 'core/theme/app_theme.dart';
 import 'screens/app_shell.dart';
 import 'services/notification_service.dart';
 import 'services/api_service.dart';
+import 'core/error_recovery.dart';
 
 final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 
@@ -21,6 +22,8 @@ void main() async {
 
   // 1. Initialize API Client and persistent base URL settings
   await ApiService().init();
+  ConnectionMonitor().setBaseUrl(ApiService().baseUrl);
+  ConnectionMonitor().startMonitoring();
 
   // 2. Initialize Firebase Core & Background Messaging
   try {

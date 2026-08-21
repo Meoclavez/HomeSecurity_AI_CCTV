@@ -46,13 +46,39 @@ class ThreadedVideoIngestWorker:
         backoff = 1.0
         ring_buffer = clip_recorder_service.get_or_create_buffer(self.camera_id)
 
+        # Assuming CircuitBreaker from resilience.py
+        # If camera fails 5 times, stop hammering for 60s
+        from app.services.resilience import CircuitBreaker, ServiceHealthTracker
+        circuit_breaker = CircuitBreaker(f"rtsp_{self.camera_id}", failure_threshold=5, recovery_timeout=60.0)
+        
+        reconnect_attempts = 0
+        frame_errors = 0
+        window_start = time.time()
+        window_frames = 0
+        
+        was_open = False
+
         while self.is_running:
+            if not circuit_breaker.can_execute():
+                if not was_open:
+                    logger.warning(f"Circuit OPEN for {self.camera_id}. Emitting CAMERA_OFFLINE.")
+                    ServiceHealthTracker.report_status("video_ingest", "degraded", f"Camera {self.camera_id} offline")
+                    was_open = True
+                time.sleep(1.0)
+                continue
+            
+            if was_open and circuit_breaker.state == "CLOSED":
+                logger.info(f"Circuit CLOSED for {self.camera_id}. Emitting CAMERA_RECOVERED.")
+                ServiceHealthTracker.report_status("video_ingest", "healthy", f"Camera {self.camera_id} recovered")
+                was_open = False
+
             # Set RTSP over TCP and socket timeout (5 seconds in microseconds)
             gst_pipeline = (
                 f"rtspsrc location={self.rtsp_url} protocols=tcp timeout=5000000 ! "
                 "rtph264depay ! vaapih264dec ! videoconvert ! appsink"
             )
 
+            reconnect_attempts += 1
             # Try VA-API accelerated GStreamer pipeline first, fallback to standard RTSP
             cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
             if not cap.isOpened():
@@ -61,34 +87,52 @@ class ThreadedVideoIngestWorker:
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
             if not cap.isOpened():
-                logger.warning(f"Failed to open RTSP stream {self.camera_id}. Retrying in {backoff}s...")
+                logger.warning(f"Failed to open RTSP stream {self.camera_id}. Reconnects: {reconnect_attempts}")
+                circuit_breaker.record_failure()
                 time.sleep(backoff)
                 backoff = min(backoff * 2.0, 30.0)
                 continue
 
+            circuit_breaker.record_success()
             logger.info(f"Successfully connected to RTSP stream for {self.camera_id}")
             backoff = 1.0
+            reconnect_attempts = 0
             frame_count = 0
             start_time = time.time()
 
             while self.is_running:
+                decode_start = time.time()
                 try:
                     ret, frame = cap.read()
                 except Exception as e:
                     logger.error(f"OpenCV read error for {self.camera_id}: {e}")
                     ret, frame = False, None
+                decode_latency_ms = int((time.time() - decode_start) * 1000)
+                
+                now = time.time()
+                if now - window_start >= 60.0:
+                    if window_frames > 0 and (frame_errors / window_frames) > 0.5:
+                        logger.warning(f"High frame error rate for {self.camera_id} (>50% in 60s). Consider lowering resolution.")
+                        ServiceHealthTracker.report_status("video_ingest", "degraded", f"High frame error rate for {self.camera_id}")
+                    frame_errors = 0
+                    window_frames = 0
+                    window_start = now
+
+                window_frames += 1
                 
                 if not ret or frame is None:
+                    frame_errors += 1
                     logger.warning(f"RTSP stream dropped for {self.camera_id}. Reconnecting...")
                     break
 
                 # Apply Privacy Masking in-place on raw frame before buffer & snapshots
                 masked_frame = ai_zone_service.mask_frame(self.camera_id, frame)
 
-                now = time.time()
                 frame_count += 1
                 if now - start_time >= 1.0:
                     self.fps = frame_count / (now - start_time)
+                    if frame_count % 30 == 0:
+                        logger.debug(f"[{self.camera_id}] fps={self.fps:.1f} | frames={frame_count} | decode_latency_ms={decode_latency_ms} | reconnects={reconnect_attempts}")
                     frame_count = 0
                     start_time = now
 

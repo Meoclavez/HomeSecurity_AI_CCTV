@@ -23,6 +23,7 @@ from app.config import settings
 from app.database import async_session_factory
 from app.models.db_models import DVRSegmentModel, IncidentArchiveModel, CameraModel
 from app.services.auth_service import auth_service
+from app.services.resilience import ServiceHealthTracker
 
 logger = logging.getLogger("DVRRecorder")
 
@@ -60,6 +61,13 @@ class DVRCameraWorker:
     def _supervise_loop(self):
         backoff = 1.0
         while self.is_running:
+            total, used, free = shutil.disk_usage(str(self.base_dvr_dir))
+            if (used / total) > 0.90:
+                logger.critical(f"Disk usage > 90%, skipping DVR recording for {self.camera_id}")
+                ServiceHealthTracker.report_status("dvr_recorder", "degraded", "Disk usage critical")
+                time.sleep(30.0)
+                continue
+
             camera_dir = self.base_dvr_dir / self.camera_id
             camera_dir.mkdir(parents=True, exist_ok=True)
             segment_pattern = str(camera_dir / "%Y%m%d_%H%M%S.mp4")
@@ -94,12 +102,14 @@ class DVRCameraWorker:
 
                 if self.is_running:
                     logger.warning(f"DVR FFmpeg exited for {self.camera_id}: {stderr.strip() if stderr else 'EOF'}")
+                    ServiceHealthTracker.report_status("dvr_recorder", "degraded", f"FFmpeg crashed for {self.camera_id}")
             except Exception as e:
                 logger.error(f"DVR process error for {self.camera_id}: {e}")
+                ServiceHealthTracker.report_status("dvr_recorder", "degraded", f"FFmpeg error for {self.camera_id}: {e}")
 
             if self.is_running:
-                time.sleep(backoff)
-                backoff = min(backoff * 2.0, 30.0)
+                logger.info(f"Auto-restarting DVR segmenter for {self.camera_id} in 5s...")
+                time.sleep(5.0)
             else:
                 break
 

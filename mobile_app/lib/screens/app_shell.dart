@@ -6,6 +6,7 @@ import 'events_center_screen.dart';
 import 'zone_editor_screen.dart';
 import 'clip_archives_screen.dart';
 import 'storage_health_screen.dart';
+import '../core/error_recovery.dart';
 
 enum NavSection {
   liveGrid,
@@ -81,20 +82,39 @@ class _AppShellState extends State<AppShell> {
   }
 
   Widget _buildBody() {
+    Widget child;
     switch (NavSection.values[_currentIndex]) {
       case NavSection.liveGrid:
-        return const MultiCamGridScreen();
+        child = const MultiCamGridScreen();
+        break;
       case NavSection.dvrTimeline:
-        return const DVRPlaybackScreen();
+        child = const DVRPlaybackScreen();
+        break;
       case NavSection.eventsCenter:
-        return const EventsCenterScreen();
+        child = const EventsCenterScreen();
+        break;
       case NavSection.zoneEditor:
-        return const ZoneEditorScreen();
+        child = const ZoneEditorScreen();
+        break;
       case NavSection.clipArchives:
-        return const ClipArchivesScreen();
+        child = const ClipArchivesScreen();
+        break;
       case NavSection.storageHealth:
-        return const StorageHealthScreen();
+        child = const StorageHealthScreen();
+        break;
     }
+    
+    return Column(
+      children: [
+        ListenableBuilder(
+          listenable: ConnectionMonitor(),
+          builder: (context, _) {
+            return OfflineIndicatorBanner(state: ConnectionMonitor().state);
+          },
+        ),
+        Expanded(child: ErrorBoundary(child: child)),
+      ],
+    );
   }
 
   @override

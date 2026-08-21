@@ -182,24 +182,54 @@ class NotificationService {
           debugPrint('FCM Device Token: $token');
           await ApiService().registerDevice(token, kIsWeb ? 'web' : (Platform.isIOS ? 'ios' : 'android'));
         }
+        
+        messaging.onTokenRefresh.listen((token) async {
+          debugPrint('FCM Token Refreshed: $token');
+          await ApiService().registerDevice(token, kIsWeb ? 'web' : (Platform.isIOS ? 'ios' : 'android'));
+        });
+      } else {
+        debugPrint('Notification permissions denied.');
+        // Wait a frame for navigation context to be ready
+        Future.delayed(const Duration(seconds: 2), () {
+          _showPermissionDeniedDialog();
+        });
       }
 
       FirebaseMessaging.onMessage.listen((RemoteMessage message) {
+        debugPrint('FCM Message Received: ${message.messageId}');
         if (message.data['is_emergency'] == 'true' || message.data['type'] == 'CRITICAL_ALERT') {
           _navigateToEventFromPayload(message.data);
         }
       });
 
       FirebaseMessaging.onMessageOpenedApp.listen((RemoteMessage message) {
+        debugPrint('FCM Message Tapped: ${message.messageId}');
         _navigateToEventFromPayload(message.data);
       });
 
       final initialMessage = await messaging.getInitialMessage();
       if (initialMessage != null) {
+        debugPrint('FCM Initial Message Tapped: ${initialMessage.messageId}');
         _navigateToEventFromPayload(initialMessage.data);
       }
     } catch (e) {
       debugPrint('Firebase messaging listener notice: $e');
+    }
+  }
+  
+  void _showPermissionDeniedDialog() {
+    if (navigatorKey?.currentState?.overlay?.context != null) {
+      final context = navigatorKey!.currentState!.overlay!.context;
+      showDialog(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Notifications Disabled'),
+          content: const Text('Critical security alerts may not reach you in time. Please enable notifications in your device settings.'),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(context), child: const Text('Dismiss')),
+          ],
+        ),
+      );
     }
   }
 

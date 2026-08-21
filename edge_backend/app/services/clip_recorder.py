@@ -19,6 +19,7 @@ import numpy as np
 
 from app.config import settings
 from app.services.auth_service import auth_service
+from app.services.resilience import ServiceHealthTracker
 
 logger = logging.getLogger("ClipRecorder")
 
@@ -137,6 +138,12 @@ class ClipRecorderService:
         fps: int = 15
     ) -> str:
         """Capture pre-event buffer and record post-roll frames, muxing into an optimized MP4."""
+        total, used, free = shutil.disk_usage(str(settings.CLIPS_DIR))
+        if (used / total) > 0.90:
+            logger.critical(f"Disk usage > 90% ({(used/total)*100:.1f}%), skipping clip recording for {event_id}")
+            ServiceHealthTracker.report_status("clip_recorder", "degraded", "Disk usage critical")
+            return ""
+
         buf = self.get_or_create_buffer(camera_id, fps=fps)
         pre_frames = buf.get_pre_event_frames()
         post_frames = []
@@ -157,6 +164,12 @@ class ClipRecorderService:
 
         await asyncio.to_thread(self._mux_frames_to_mp4, all_frames, output_path, fps)
 
+        if output_path.exists():
+            file_size_bytes = output_path.stat().st_size
+            clip_duration_ms = int((len(all_frames) / fps) * 1000)
+            logger.info(f"Clip recorded: {output_filename} | clip_duration_ms={clip_duration_ms} | file_size_bytes={file_size_bytes}")
+            ServiceHealthTracker.report_status("clip_recorder", "healthy", "Clip recorded successfully")
+
         token = auth_service.generate_clip_token(event_id)
         clip_url = f"{settings.EDGE_BASE_URL}/api/v1/events/clips/{output_filename}?token={token}"
         return clip_url
@@ -176,6 +189,7 @@ class ClipRecorderService:
             out.write(frame)
         out.release()
 
+        start_time = time.time()
         try:
             cmd = [
                 "ffmpeg", "-y",
@@ -188,12 +202,17 @@ class ClipRecorderService:
                 str(output_path)
             ]
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=60.0)
-            if temp_raw_path.exists():
-                temp_raw_path.unlink()
+            encoding_latency_ms = int((time.time() - start_time) * 1000)
+            logger.info(f"Encoding successful for {output_path.name} | encoding_latency_ms={encoding_latency_ms}")
         except Exception as e:
             logger.error(f"FFmpeg remuxing fallback to raw video: {e}")
             if temp_raw_path.exists():
                 temp_raw_path.rename(output_path)
-
+        finally:
+            if temp_raw_path.exists():
+                try:
+                    temp_raw_path.unlink()
+                except OSError:
+                    pass
 
 clip_recorder_service = ClipRecorderService()

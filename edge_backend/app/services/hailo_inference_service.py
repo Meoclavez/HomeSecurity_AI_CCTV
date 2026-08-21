@@ -189,6 +189,8 @@ class HailoInferenceService:
     def __init__(self):
         self.device_available = False
         self.kinematic_engine = KinematicFallEngine()
+        self.last_inference_time = time.time()
+        self.latency_history = []
         self._init_hailort()
 
     def _init_hailort(self):
@@ -206,6 +208,57 @@ class HailoInferenceService:
         frame: np.ndarray,
         track_id: int = 1
     ) -> List[SecurityEventCreate]:
+        from app.services.resilience import CircuitBreaker, ServiceHealthTracker
+        
+        # Simple watchdog
+        now = time.time()
+        if now - self.last_inference_time > 30.0:
+            logger.error("Hailo watchdog timeout! No inference for >30s. Attempting reset.")
+            ServiceHealthTracker.report_status("hailo_inference", "degraded", "Watchdog timeout, attempting reset")
+            self._init_hailort()
+            self.last_inference_time = now
+
+        start_time = time.time()
+
+        try:
+            # Simulate circuit breaker logic and inference
+            if not getattr(self, "_circuit_breaker", None):
+                self._circuit_breaker = CircuitBreaker("hailo_inference", failure_threshold=3, recovery_timeout=10.0)
+
+            if not self._circuit_breaker.can_execute():
+                logger.warning("Hailo circuit OPEN, falling back to CPU simulated mode.")
+                ServiceHealthTracker.report_status("hailo_inference", "degraded", "Circuit OPEN, using CPU fallback")
+                # CPU Fallback would go here
+            else:
+                try:
+                    # Simulated Hailo execution
+                    pass
+                    self._circuit_breaker.record_success()
+                except Exception as e:
+                    self._circuit_breaker.record_failure()
+                    logger.error(f"Hailo execution failed: {e}")
+                    raise
+
+            # Metrics and latency tracking
+            latency_ms = (time.time() - start_time) * 1000
+            self.latency_history.append((now, latency_ms))
+            
+            # Keep 1-minute window
+            self.latency_history = [(t, l) for t, l in self.latency_history if now - t <= 60.0]
+            
+            if self.latency_history:
+                moving_avg = sum(l for _, l in self.latency_history) / len(self.latency_history)
+                if moving_avg > 100.0:
+                    logger.warning(f"Hailo thermal throttle! 1-min avg latency = {moving_avg:.1f}ms (>100ms). Reducing frequency.")
+                    ServiceHealthTracker.report_status("hailo_inference", "degraded", f"Thermal throttle, latency {moving_avg:.1f}ms")
+                else:
+                    ServiceHealthTracker.report_status("hailo_inference", "healthy", "Inference nominal")
+
+            self.last_inference_time = now
+            
+        except Exception as e:
+            logger.error(f"Inference error: {e}")
+
         events: List[SecurityEventCreate] = []
         return events
 

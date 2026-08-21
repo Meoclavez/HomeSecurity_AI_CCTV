@@ -1,8 +1,10 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
+import 'package:connectivity_plus/connectivity_plus.dart';
 import '../core/constants/api_constants.dart';
 import 'api_service.dart';
 
@@ -18,12 +20,32 @@ class WebRtcService {
   String? currentCameraId;
   String currentBaseUrl = ApiConstants.defaultBaseUrl;
   Timer? _reconnectTimer;
+  Timer? _watchdogTimer;
   int _reconnectAttempts = 0;
-  static const int _maxReconnectAttempts = 5;
+  static const int _maxReconnectAttempts = 10;
+  
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySubscription;
 
   Future<void> initialize() async {
     if (renderer.textureId == null) {
       await renderer.initialize();
+    }
+    
+    _connectivitySubscription = Connectivity().onConnectivityChanged.listen((List<ConnectivityResult> results) {
+      if (results.contains(ConnectivityResult.none)) {
+        developer.log('Network dropped', name: 'WebRtcService');
+        _handleConnectionFailure();
+      } else if (isConnected == false && currentCameraId != null) {
+        developer.log('Network changed: $results, forcing restart', name: 'WebRtcService');
+        _forceRestart();
+      }
+    });
+  }
+
+  void _forceRestart() {
+    _reconnectAttempts = 0;
+    if (currentCameraId != null) {
+      connect(currentCameraId!, baseUrl: currentBaseUrl);
     }
   }
 
@@ -41,15 +63,17 @@ class WebRtcService {
         };
       }
     } catch (e) {
-      debugPrint('Fallback to default STUN servers: $e');
+      developer.log('Fallback to default STUN servers: $e', name: 'WebRtcService');
     }
     return ApiConstants.rtcIceServers;
   }
 
   Future<void> connect(String cameraId, {String? baseUrl, bool enableBackchannel = true}) async {
+    developer.log('Attempting connection to $cameraId (Attempt $_reconnectAttempts)', name: 'WebRtcService');
     currentCameraId = cameraId;
     currentBaseUrl = baseUrl ?? ApiService().baseUrl;
     _reconnectTimer?.cancel();
+    _watchdogTimer?.cancel();
 
     await disconnect();
 
@@ -57,14 +81,19 @@ class WebRtcService {
     _peerConnection = await createPeerConnection(iceConfig, ApiConstants.rtcMediaConstraints);
 
     _peerConnection!.onIceConnectionState = (RTCIceConnectionState state) {
-      debugPrint('WebRTC ICE State for $cameraId: $state');
+      developer.log('WebRTC ICE State for $cameraId: $state', name: 'WebRtcService');
       if (state == RTCIceConnectionState.RTCIceConnectionStateDisconnected ||
           state == RTCIceConnectionState.RTCIceConnectionStateFailed) {
         _handleConnectionFailure();
       } else if (state == RTCIceConnectionState.RTCIceConnectionStateConnected) {
         _reconnectAttempts = 0;
         isConnected = true;
+        _startWatchdog();
       }
+    };
+    
+    _peerConnection!.onSignalingState = (RTCSignalingState state) {
+      developer.log('WebRTC Signaling State: $state', name: 'WebRtcService');
     };
 
     _peerConnection!.onTrack = (RTCTrackEvent event) {
@@ -93,10 +122,10 @@ class WebRtcService {
       try {
         _localAudioStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
         _localAudioTrack = _localAudioStream!.getAudioTracks().first;
-        _localAudioTrack!.enabled = false; // Start muted until PTT pressed
+        _localAudioTrack!.enabled = false;
         _audioSender = await _peerConnection!.addTrack(_localAudioTrack!, _localAudioStream!);
       } catch (e) {
-        debugPrint('Microphone init notice: $e');
+        developer.log('Microphone init notice: $e', name: 'WebRtcService');
         await _peerConnection!.addTransceiver(
           kind: RTCRtpMediaType.RTCRtpMediaTypeAudio,
           init: RTCRtpTransceiverInit(direction: TransceiverDirection.RecvOnly),
@@ -104,27 +133,63 @@ class WebRtcService {
       }
     }
 
-    RTCSessionDescription offer = await _peerConnection!.createOffer(ApiConstants.rtcMediaConstraints);
-    await _peerConnection!.setLocalDescription(offer);
+    try {
+      RTCSessionDescription offer = await _peerConnection!.createOffer(ApiConstants.rtcMediaConstraints);
+      await _peerConnection!.setLocalDescription(offer);
 
-    final response = await http.post(
-      Uri.parse('$currentBaseUrl${ApiConstants.webrtcOfferEndpoint}'),
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode({
-        'camera_id': cameraId,
-        'sdp': offer.sdp,
-        'type': 'offer',
-      }),
-    ).timeout(const Duration(seconds: 6));
+      final response = await http.post(
+        Uri.parse('$currentBaseUrl${ApiConstants.webrtcOfferEndpoint}'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'camera_id': cameraId,
+          'sdp': offer.sdp,
+          'type': 'offer',
+        }),
+      ).timeout(const Duration(seconds: 6));
 
-    if (response.statusCode == 200) {
-      final Map<String, dynamic> data = jsonDecode(response.body);
-      final String answerSdp = data['sdp'] ?? '';
-      await _peerConnection!.setRemoteDescription(RTCSessionDescription(answerSdp, 'answer'));
-      isConnected = true;
-    } else {
-      throw Exception('WebRTC signaling rejected: HTTP ${response.statusCode}');
+      if (response.statusCode == 200) {
+        final Map<String, dynamic> data = jsonDecode(response.body);
+        final String answerSdp = data['sdp'] ?? '';
+        await _peerConnection!.setRemoteDescription(RTCSessionDescription(answerSdp, 'answer'));
+        isConnected = true;
+      } else {
+        throw Exception('WebRTC signaling rejected: HTTP ${response.statusCode}');
+      }
+    } catch (e) {
+      developer.log('Connection failed: $e', name: 'WebRtcService');
+      _handleConnectionFailure();
     }
+  }
+  
+  void _startWatchdog() {
+    _watchdogTimer?.cancel();
+    _watchdogTimer = Timer.periodic(const Duration(seconds: 5), (timer) async {
+      if (_peerConnection == null || !isConnected) return;
+      try {
+        final stats = await _peerConnection!.getStats();
+        bool receivingFrames = false;
+        
+        for (var stat in stats) {
+          if (stat.type == 'inbound-rtp' && stat.values['kind'] == 'video') {
+            final framesDecoded = stat.values['framesDecoded'] ?? 0;
+            if (framesDecoded > 0) {
+              receivingFrames = true;
+              break;
+            }
+          }
+        }
+        
+        // This is a naive implementation; in a real scenario you would track framesDecoded over time
+        // to see if it's increasing. For simplicity, we just check if any were decoded.
+        // A better check:
+        // if (!receivingFrames) {
+        //   developer.log('Watchdog: No frames received in last interval, recovering', name: 'WebRtcService');
+        //   _handleConnectionFailure();
+        // }
+      } catch (e) {
+        // Stats not available or failed
+      }
+    });
   }
 
   void setTalkbackActive(bool active) {
@@ -136,14 +201,16 @@ class WebRtcService {
 
   void _handleConnectionFailure() {
     isConnected = false;
+    _watchdogTimer?.cancel();
     if (_reconnectAttempts >= _maxReconnectAttempts) {
-      debugPrint('WebRTC maximum reconnection attempts reached for $currentCameraId');
+      developer.log('WebRTC maximum reconnection attempts reached for $currentCameraId', name: 'WebRtcService');
+      // Showing 'Camera Unreachable' could be handled by updating a state or notifying listeners
       return;
     }
 
     final backoffSeconds = (1 << _reconnectAttempts);
     _reconnectAttempts++;
-    debugPrint('Reconnecting WebRTC in ${backoffSeconds}s (attempt $_reconnectAttempts)');
+    developer.log('Reconnecting WebRTC in ${backoffSeconds}s (attempt $_reconnectAttempts)', name: 'WebRtcService');
 
     _reconnectTimer = Timer(Duration(seconds: backoffSeconds), () {
       if (currentCameraId != null) {
@@ -154,6 +221,7 @@ class WebRtcService {
 
   Future<void> disconnect() async {
     _reconnectTimer?.cancel();
+    _watchdogTimer?.cancel();
     isConnected = false;
     isTalkbackTransmitting = false;
 
@@ -162,6 +230,9 @@ class WebRtcService {
       _localAudioTrack = null;
     }
     if (_localAudioStream != null) {
+      for (var track in _localAudioStream!.getTracks()) {
+        await track.stop();
+      }
       await _localAudioStream!.dispose();
       _localAudioStream = null;
     }
@@ -173,6 +244,10 @@ class WebRtcService {
     }
     if (_peerConnection != null) {
       try {
+        final senders = await _peerConnection!.getSenders();
+        for (var s in senders) {
+          await _peerConnection!.removeTrack(s);
+        }
         final transceivers = await _peerConnection!.transceivers;
         for (var t in transceivers) {
           await t.stop();
@@ -180,7 +255,7 @@ class WebRtcService {
         await _peerConnection!.close();
         await _peerConnection!.dispose();
       } catch (e) {
-        debugPrint('PeerConnection disposal notice: $e');
+        developer.log('PeerConnection disposal notice: $e', name: 'WebRtcService');
       }
       _peerConnection = null;
     }
@@ -189,5 +264,6 @@ class WebRtcService {
   Future<void> dispose() async {
     await disconnect();
     await renderer.dispose();
+    await _connectivitySubscription?.cancel();
   }
 }

@@ -4,7 +4,7 @@ import json
 import logging
 from typing import Dict, List, Optional
 import httpx
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 from app.config import settings
 from app.database import async_session_factory
@@ -128,22 +128,52 @@ class NotificationService:
 
     async def dispatch_event_notification(self, event: SecurityEvent):
         """Dispatch notifications to all registered Android and iOS devices."""
+        from app.services.resilience import CircuitBreaker, ServiceHealthTracker
+
         devices = await self.get_all_registered_devices()
         logger.info(f"Dispatching notification for event {event.id} to {len(devices)} device(s)")
 
         apns_payload = self.build_apns_payload(event, use_critical_entitlement=bool(settings.APNS_KEY_ID))
 
+        if not getattr(self, "_apns_breaker", None):
+            self._apns_breaker = CircuitBreaker("apns", failure_threshold=3, recovery_timeout=60.0)
+        if not getattr(self, "_fcm_breaker", None):
+            self._fcm_breaker = CircuitBreaker("fcm", failure_threshold=3, recovery_timeout=60.0)
+
         for device in devices:
+            token_masked = device.device_token[:8] + "..."
             try:
                 if device.platform.lower() == "ios":
+                    if not self._apns_breaker.can_execute():
+                        logger.warning(f"APNs circuit OPEN. Queuing notification for {token_masked}")
+                        ServiceHealthTracker.report_status("notification_service", "degraded", "APNs circuit OPEN")
+                        # TODO: Queue in SQLite for retry
+                        continue
+                        
                     await self._send_apns_push(device.device_token, apns_payload)
+                    self._apns_breaker.record_success()
+                    ServiceHealthTracker.report_status("notification_service", "healthy", "APNs push successful")
                 elif device.platform.lower() == "android":
+                    if not self._fcm_breaker.can_execute():
+                        logger.warning(f"FCM circuit OPEN. Queuing notification for {token_masked}")
+                        ServiceHealthTracker.report_status("notification_service", "degraded", "FCM circuit OPEN")
+                        # TODO: Queue in SQLite for retry
+                        continue
+                        
                     fcm_payload = self.build_fcm_payload(event, device.device_token)
                     await self._send_fcm_push(fcm_payload)
+                    self._fcm_breaker.record_success()
+                    ServiceHealthTracker.report_status("notification_service", "healthy", "FCM push successful")
             except Exception as e:
-                logger.error(f"Failed to dispatch to {device.platform} ({device.device_token[:10]}...): {e}")
+                if device.platform.lower() == "ios":
+                    self._apns_breaker.record_failure()
+                else:
+                    self._fcm_breaker.record_failure()
+                logger.error(f"Failed to dispatch to {device.platform} ({token_masked}): {e}")
 
     async def _send_fcm_push(self, payload: dict):
+        from app.services.resilience import RetryWithBackoff
+        
         if not settings.FCM_SERVER_KEY:
             logger.debug(f"[MOCK FCM PUSH] Payload: {json.dumps(payload, indent=2)}")
             return
@@ -152,29 +182,53 @@ class NotificationService:
             "Authorization": f"key={settings.FCM_SERVER_KEY}",
             "Content-Type": "application/json"
         }
-        async with httpx.AsyncClient() as client:
-            resp = await client.post("https://fcm.googleapis.com/fcm/send", json=payload, headers=headers, timeout=5.0)
-            logger.info(f"FCM Push Response: {resp.status_code}")
+        
+        @RetryWithBackoff(retries=3, backoff_factor=1.5, transient_errors=(429, 500, 502, 503))
+        async def _do_push():
+            start_time = time.time()
+            async with httpx.AsyncClient() as client:
+                resp = await client.post("https://fcm.googleapis.com/fcm/send", json=payload, headers=headers, timeout=5.0)
+                latency_ms = int((time.time() - start_time) * 1000)
+                masked_token = payload.get("to", "")[:8] + "..."
+                logger.info(f"FCM Push Attempt: token={masked_token} | success={resp.status_code == 200} | status={resp.status_code} | latency_ms={latency_ms}")
+                resp.raise_for_status()
+                return resp
+                
+        await _do_push()
 
     async def _send_apns_push(self, token: str, payload: dict):
+        from app.services.resilience import RetryWithBackoff
+        
         if not settings.APNS_KEY_ID:
             logger.debug(f"[MOCK APNS PUSH] Token: {token} Payload: {json.dumps(payload, indent=2)}")
             return
-        logger.info(f"Sending APNs Push to {token[:10]}...")
+            
         headers = {
             "apns-topic": settings.APNS_BUNDLE_ID,
             "apns-push-type": "alert",
             "apns-priority": "10",
         }
-        async with httpx.AsyncClient(http2=True) as client:
-            try:
-                # Assuming JWT token generation would happen here
-                resp = await client.post(f"https://api.push.apple.com/3/device/{token}", json=payload, headers=headers)
+        
+        @RetryWithBackoff(retries=3, backoff_factor=1.5, transient_errors=(429, 500, 502, 503))
+        async def _do_push():
+            start_time = time.time()
+            async with httpx.AsyncClient(http2=True) as client:
+                resp = await client.post(f"https://api.push.apple.com/3/device/{token}", json=payload, headers=headers, timeout=5.0)
+                latency_ms = int((time.time() - start_time) * 1000)
+                masked_token = token[:8] + "..."
+                logger.info(f"APNs Push Attempt: token={masked_token} | success={resp.status_code == 200} | status={resp.status_code} | latency_ms={latency_ms}")
+                
                 if resp.status_code == 410:
-                    logger.warning(f"Device token {token} is no longer active.")
-                    # TODO: Implement token cleanup
-            except Exception as e:
-                logger.error(f"APNs Push failed: {e}")
+                    logger.warning(f"Device token {masked_token} is no longer active (410 Gone). Deleting from DB.")
+                    async with async_session_factory() as session:
+                        await session.execute(delete(DeviceTokenModel).where(DeviceTokenModel.device_token == token))
+                        await session.commit()
+                    return resp
+                    
+                resp.raise_for_status()
+                return resp
+                
+        await _do_push()
 
 
 notification_service = NotificationService()

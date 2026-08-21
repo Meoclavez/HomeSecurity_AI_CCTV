@@ -15,11 +15,10 @@ from app.services.video_ingest_service import video_ingest_service
 from app.services.clip_recorder import StorageCleaner
 from app.services.dvr_recorder import dvr_recorder_service
 from app.services.mdns_service import mdns_advertiser
+from app.services.resilience import setup_structured_logging, ServiceHealthTracker
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
-)
+# Setup structured JSON logging with rotating file handler
+setup_structured_logging()
 logger = logging.getLogger("CCTVCore")
 
 DEFAULT_CAMERAS = [
@@ -94,51 +93,84 @@ async def lifespan(app: FastAPI):
     """Lifecycle manager: Initialize SQLite schema, seed cameras, start workers, mDNS & DVR."""
     logger.info(f"Starting {settings.APP_NAME} v{settings.VERSION}")
     logger.info(f"Hardware Passthrough: VA-API={settings.VAAPI_DEVICE}, HailoRT={settings.HAILO_DEVICE}")
+    
+    # Initialize Service Health Tracker
+    health_tracker = ServiceHealthTracker()
 
     # 1. Initialize SQLite Database Schema
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        health_tracker.record_success("database")
+    except Exception as e:
+        logger.error(f"Database schema initialization failed: {e}")
+        health_tracker.record_failure("database", str(e))
 
     # 2. Seed default cameras if table is empty
-    async with async_session_factory() as session:
-        stmt = select(CameraModel)
-        res = await session.execute(stmt)
-        existing = res.scalars().all()
-        if not existing:
-            logger.info("Seeding default camera configurations into SQLite DB...")
-            for c_data in DEFAULT_CAMERAS:
-                session.add(CameraModel(**c_data))
-            await session.commit()
+    try:
+        async with async_session_factory() as session:
+            stmt = select(CameraModel)
+            res = await session.execute(stmt)
+            existing = res.scalars().all()
+            if not existing:
+                logger.info("Seeding default camera configurations into SQLite DB...")
+                for c_data in DEFAULT_CAMERAS:
+                    session.add(CameraModel(**c_data))
+                await session.commit()
+    except Exception as e:
+        logger.error(f"Failed to seed default cameras: {e}")
 
     # 3. Start AI Video Ingest & 24/7 Segmented DVR Workers
-    async with async_session_factory() as session:
-        res = await session.execute(select(CameraModel))
-        cameras_list = res.scalars().all()
-        for camera in cameras_list:
-            try:
-                await video_ingest_service.register_and_start_camera(camera.id, camera.rtsp_url)
-                if camera.dvr_enabled:
-                    dvr_recorder_service.start_camera_dvr(camera.id, camera.rtsp_url)
-            except Exception as e:
-                logger.warning(f"Could not auto-start ingest/DVR for {camera.id}: {e}")
+    try:
+        async with async_session_factory() as session:
+            res = await session.execute(select(CameraModel))
+            cameras_list = res.scalars().all()
+            for camera in cameras_list:
+                try:
+                    await video_ingest_service.register_and_start_camera(camera.id, camera.rtsp_url)
+                    if camera.dvr_enabled:
+                        dvr_recorder_service.start_camera_dvr(camera.id, camera.rtsp_url)
+                    health_tracker.record_success(f"rtsp_{camera.id}")
+                except Exception as e:
+                    logger.warning(f"Could not auto-start ingest/DVR for {camera.id}: {e}")
+                    health_tracker.record_failure(f"rtsp_{camera.id}", str(e))
+    except Exception as e:
+        logger.error(f"Failed to load cameras for auto-start: {e}")
 
     # 4. Start mDNS Zeroconf Broadcaster for local Flutter app discovery
-    await mdns_advertiser.start()
+    try:
+        await mdns_advertiser.start()
+    except Exception as e:
+        logger.warning(f"mDNS advertiser failed to start: {e}")
 
     # 5. Start background DVR indexer and storage cleaner
-    cleaner_task = asyncio.create_task(periodic_dvr_indexer_and_cleaner())
+    cleaner_task = None
+    try:
+        cleaner_task = asyncio.create_task(periodic_dvr_indexer_and_cleaner())
+    except Exception as e:
+        logger.warning(f"DVR background cleaner failed to start: {e}")
 
     yield
 
     logger.info("Shutting down Edge CCTV Core services...")
-    cleaner_task.cancel()
+    if cleaner_task:
+        cleaner_task.cancel()
+        try:
+            await cleaner_task
+        except asyncio.CancelledError:
+            pass
     try:
-        await cleaner_task
-    except asyncio.CancelledError:
-        pass
-    await mdns_advertiser.stop()
-    dvr_recorder_service.stop_all()
-    await video_ingest_service.stop_all()
+        await mdns_advertiser.stop()
+    except Exception as e:
+        logger.error(f"Error stopping mDNS: {e}")
+    try:
+        dvr_recorder_service.stop_all()
+    except Exception as e:
+        logger.error(f"Error stopping DVR: {e}")
+    try:
+        await video_ingest_service.stop_all()
+    except Exception as e:
+        logger.error(f"Error stopping video ingest: {e}")
 
 
 app = FastAPI(
@@ -164,6 +196,44 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Edge-API-Key"],
 )
+
+import time
+from fastapi.responses import JSONResponse
+from fastapi import Request
+
+@app.middleware("http")
+async def add_process_time_header_and_log(request: Request, call_next):
+    start_time = time.time()
+    try:
+        response = await call_next(request)
+        process_time_ms = (time.time() - start_time) * 1000
+        logger.info(
+            "Request completed",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": response.status_code,
+                "latency_ms": process_time_ms
+            }
+        )
+        return response
+    except Exception as e:
+        process_time_ms = (time.time() - start_time) * 1000
+        logger.error(
+            f"Uncaught exception: {str(e)}",
+            exc_info=True,
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": 500,
+                "latency_ms": process_time_ms,
+                "error_type": type(e).__name__
+            }
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal Server Error", "error_type": type(e).__name__}
+        )
 
 # Mount Routers
 app.include_router(health.router)
