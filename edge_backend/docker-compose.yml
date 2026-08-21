@@ -7,10 +7,13 @@ services:
     container_name: cctv_coturn
     restart: unless-stopped
     network_mode: host
+    entrypoint: ["/entrypoint.sh"]
     volumes:
       - ./coturn/coturn.conf:/etc/coturn/coturn.conf:ro
+      - ./coturn/entrypoint.sh:/entrypoint.sh:ro
     environment:
       - TZ=UTC
+      - COTURN_SECRET=${COTURN_SECRET:-cctv_turn_super_secret_dynamic_key_change_me_in_prod}
     security_opt:
       - no-new-privileges:true
 
