@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.database import engine, async_session_factory
 from app.models.db_models import Base, CameraModel
-from app.routes import cameras, events, webrtc, health, dvr, zones
+from app.routes import cameras, events, webrtc, health, dvr, zones, setup
 from app.services.video_ingest_service import video_ingest_service
 from app.services.clip_recorder import StorageCleaner
 from app.services.dvr_recorder import dvr_recorder_service
@@ -105,6 +105,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Database schema initialization failed: {e}")
         health_tracker.record_failure("database", str(e))
+        
+    # Check if setup is completed
+    try:
+        from app.services.setup_service import setup_service
+        async with async_session_factory() as session:
+            is_setup = await setup_service.is_setup_completed(session)
+            app.state.setup_completed = is_setup
+            if not is_setup:
+                logger.warning(
+                    "\n=======================================================\n"
+                    " SYSTEM SETUP REQUIRED!\n"
+                    " Please visit /api/v1/setup/status to complete setup.\n"
+                    "=======================================================\n"
+                )
+    except Exception as e:
+        logger.error(f"Failed to check setup status: {e}")
 
     # 2. Seed default cameras if table is empty
     try:
@@ -202,6 +218,31 @@ from fastapi.responses import JSONResponse
 from fastapi import Request
 
 @app.middleware("http")
+async def setup_check_middleware(request: Request, call_next):
+    # Bypass for setup routes, docs, and root
+    path = request.url.path
+    if path.startswith("/api/v1/setup") or path.startswith("/api/v1/auth") or path in ("/", "/docs", "/openapi.json"):
+        return await call_next(request)
+        
+    # Check if setup is completed (caching the result to avoid DB hits every request would be better in prod)
+    if getattr(app.state, "setup_completed", False) is False:
+        # Check DB
+        try:
+            from app.services.setup_service import setup_service
+            async with async_session_factory() as session:
+                is_completed = await setup_service.is_setup_completed(session)
+                app.state.setup_completed = is_completed
+                if not is_completed:
+                    return JSONResponse(
+                        status_code=403,
+                        content={"error": "setup_required", "setup_url": "/api/v1/setup/status"}
+                    )
+        except Exception:
+            pass
+            
+    return await call_next(request)
+
+@app.middleware("http")
 async def add_process_time_header_and_log(request: Request, call_next):
     start_time = time.time()
     try:
@@ -236,6 +277,7 @@ async def add_process_time_header_and_log(request: Request, call_next):
         )
 
 # Mount Routers
+app.include_router(setup.router, prefix="/api/v1")
 app.include_router(health.router)
 app.include_router(cameras.router)
 app.include_router(events.router)

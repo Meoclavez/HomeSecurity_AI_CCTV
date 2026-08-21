@@ -239,9 +239,13 @@ class AuthService:
             intrusion_detector.record_success(ip, "api_key")
             return True
         # Check bearer token
-        if bearer and self.verify_token(bearer.credentials):
-            intrusion_detector.record_success(ip, "bearer_token")
-            return True
+        if bearer:
+            payload = self.verify_token(bearer.credentials)
+            if payload and payload.get("type") in ("user_session", "stream_access", "clip_access"):
+                intrusion_detector.record_success(ip, "bearer_token")
+                # Attach payload to request state for downstream use
+                request.state.user = payload
+                return True
         if settings.DEBUG:
             return True
         intrusion_detector.record_failure(ip)
@@ -274,6 +278,95 @@ class AuthService:
             raise HTTPException(status_code=404, detail="Requested file not found")
 
         return target_resolved
+
+    def generate_app_pairing_code(self) -> str:
+        code = "".join([str(secrets.randbelow(10)) for _ in range(6)])
+        # In a real implementation we would save this to the DB with a 5m expiry
+        return code
+
+    async def create_admin_user(self, session, username, password, display_name, role="owner"):
+        from passlib.hash import bcrypt
+        from app.models.db_models import AdminUserModel
+        import uuid
+        from sqlalchemy import select
+
+        stmt = select(AdminUserModel).where(AdminUserModel.username == username)
+        result = await session.execute(stmt)
+        if result.scalar_one_or_none():
+            raise HTTPException(status_code=400, detail="User already exists")
+
+        hashed = bcrypt.hash(password)
+        new_user = AdminUserModel(
+            id=str(uuid.uuid4()),
+            username=username,
+            password_hash=hashed,
+            display_name=display_name,
+            role=role
+        )
+        session.add(new_user)
+        await session.commit()
+        return new_user
+
+    async def authenticate_user(self, session, username, password):
+        from passlib.hash import bcrypt
+        from app.models.db_models import AdminUserModel
+        from sqlalchemy import select
+
+        stmt = select(AdminUserModel).where(AdminUserModel.username == username)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+
+        if not user or not bcrypt.verify(password, user.password_hash):
+            return None
+
+        # Create JWT access and refresh tokens
+        access_payload = {
+            "sub": user.id,
+            "type": "user_session",
+            "role": user.role,
+            "iat": int(time.time()),
+            "exp": int(time.time()) + (24 * 3600),
+        }
+        refresh_payload = {
+            "sub": user.id,
+            "type": "refresh",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + (30 * 24 * 3600),
+        }
+        
+        return {
+            "access_token": jwt.encode(access_payload, self.secret, algorithm=self.algorithm),
+            "refresh_token": jwt.encode(refresh_payload, self.secret, algorithm=self.algorithm)
+        }
+        
+    def refresh_access_token(self, refresh_token: str):
+        payload = self.verify_token(refresh_token)
+        if not payload or payload.get("type") != "refresh":
+            raise HTTPException(status_code=401, detail="Invalid refresh token")
+            
+        access_payload = {
+            "sub": payload.get("sub"),
+            "type": "user_session",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + (24 * 3600),
+        }
+        return jwt.encode(access_payload, self.secret, algorithm=self.algorithm)
+
+    async def change_password(self, session, user_id, old_password, new_password):
+        from passlib.hash import bcrypt
+        from app.models.db_models import AdminUserModel
+        from sqlalchemy import select
+        
+        stmt = select(AdminUserModel).where(AdminUserModel.id == user_id)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        
+        if not user or not bcrypt.verify(old_password, user.password_hash):
+            raise HTTPException(status_code=403, detail="Invalid old password")
+            
+        user.password_hash = bcrypt.hash(new_password)
+        await session.commit()
+        return True
 
 general_rate_limiter = RateLimiter(requests=100, window=60)
 auth_service = AuthService()

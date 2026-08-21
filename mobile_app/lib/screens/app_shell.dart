@@ -6,6 +6,7 @@ import 'events_center_screen.dart';
 import 'zone_editor_screen.dart';
 import 'clip_archives_screen.dart';
 import 'storage_health_screen.dart';
+import 'settings_screen.dart';
 import '../core/error_recovery.dart';
 
 enum NavSection {
@@ -15,6 +16,7 @@ enum NavSection {
   zoneEditor,
   clipArchives,
   storageHealth,
+  settings,
 }
 
 class AppShell extends StatefulWidget {
@@ -73,6 +75,13 @@ class _AppShellState extends State<AppShell> {
       selectedIcon: Icons.storage_rounded,
       badgeCount: 0,
     ),
+    NavSectionItem(
+      section: NavSection.settings,
+      label: 'Settings',
+      icon: Icons.settings_outlined,
+      selectedIcon: Icons.settings_rounded,
+      badgeCount: 0,
+    ),
   ];
 
   @override
@@ -101,6 +110,9 @@ class _AppShellState extends State<AppShell> {
         break;
       case NavSection.storageHealth:
         child = const StorageHealthScreen();
+        break;
+      case NavSection.settings:
+        child = const SettingsScreen();
         break;
     }
     
