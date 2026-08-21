@@ -277,12 +277,48 @@ class AuthService:
         if not target_resolved.is_file():
             raise HTTPException(status_code=404, detail="Requested file not found")
 
-        return target_resolved
+    _pairing_codes: Dict[str, Dict[str, Any]] = {}
 
-    def generate_app_pairing_code(self) -> str:
+    def generate_app_pairing_code(self, user_id: str = "primary_admin") -> str:
         code = "".join([str(secrets.randbelow(10)) for _ in range(6)])
-        # In a real implementation we would save this to the DB with a 5m expiry
+        self._pairing_codes[code] = {
+            "user_id": user_id,
+            "expires_at": time.time() + 300,  # 5 minutes
+        }
         return code
+
+    async def verify_app_pairing_code(self, session, code: str) -> Optional[Dict[str, str]]:
+        now = time.time()
+        # Clean expired codes
+        expired = [c for c, data in self._pairing_codes.items() if data["expires_at"] < now]
+        for c in expired:
+            del self._pairing_codes[c]
+
+        if code not in self._pairing_codes:
+            return None
+
+        entry = self._pairing_codes.pop(code)
+        user_id = entry["user_id"]
+
+        # Generate tokens
+        access_payload = {
+            "sub": user_id,
+            "type": "user_session",
+            "role": "owner",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + (24 * 3600),
+        }
+        refresh_payload = {
+            "sub": user_id,
+            "type": "refresh",
+            "iat": int(time.time()),
+            "exp": int(time.time()) + (30 * 24 * 3600),
+        }
+
+        return {
+            "access_token": jwt.encode(access_payload, self.secret, algorithm=self.algorithm),
+            "refresh_token": jwt.encode(refresh_payload, self.secret, algorithm=self.algorithm),
+        }
 
     async def create_admin_user(self, session, username, password, display_name, role="owner"):
         from passlib.hash import bcrypt

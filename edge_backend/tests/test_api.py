@@ -195,3 +195,38 @@ def test_dvr_export_incident():
     }
     response = client.post("/api/v1/cameras/cam_living_room/export", json=payload)
     assert response.status_code in [200, 404, 500]
+
+
+def test_setup_status_endpoint():
+    response = client.get("/api/v1/setup/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert "is_completed" in data
+    assert "hardware_report" in data
+
+
+def test_setup_hardware_scan():
+    response = client.post("/api/v1/setup/hardware-scan")
+    assert response.status_code == 200
+    data = response.json()
+    assert "hardware" in data
+    assert "hailo_available" in data["hardware"]
+    assert "vaapi_available" in data["hardware"]
+
+
+def test_pairing_code_flow():
+    # 1. Generate pairing code
+    code = auth_service.generate_app_pairing_code("test_admin")
+    assert len(code) == 6
+    assert code.isdigit()
+
+    # 2. Pair with the generated code
+    pair_res = client.post("/api/v1/auth/pair", json={"pairing_code": code})
+    assert pair_res.status_code == 200
+    pair_data = pair_res.json()
+    assert "access_token" in pair_data
+    assert "refresh_token" in pair_data
+
+    # 3. Subsequent pair with same code should fail (single-use)
+    replay_res = client.post("/api/v1/auth/pair", json={"pairing_code": code})
+    assert replay_res.status_code == 401

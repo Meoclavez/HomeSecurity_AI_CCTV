@@ -9,6 +9,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../core/constants/api_constants.dart';
 import '../models/camera_feed.dart';
 import '../models/security_event.dart';
+import '../models/zone_model.dart';
 
 class ApiService {
   static final ApiService _instance = ApiService._internal();
@@ -242,5 +243,36 @@ class ApiService {
       developer.log('Acknowledge event failed, queueing offline: $e', name: 'ApiService');
       _offlineQueue.add({'type': 'acknowledge_event', 'eventId': eventId});
     }
+  }
+
+  Future<List<ZoneConfig>> fetchCameraZones(String cameraId) async {
+    final endpoint = '$_baseUrl/api/v1/cameras/$cameraId/zones';
+    final response = await _sendRequestWithRetry(
+      () => http.get(Uri.parse(endpoint)).timeout(_normalTimeout),
+      endpoint
+    );
+    final List<dynamic> list = jsonDecode(response.body);
+    return list.map((z) => ZoneConfig.fromJson(z as Map<String, dynamic>)).toList();
+  }
+
+  Future<ZoneConfig> saveCameraZone(String cameraId, ZoneConfig zone) async {
+    final endpoint = '$_baseUrl/api/v1/cameras/$cameraId/zones';
+    final response = await _sendRequestWithRetry(
+      () => http.post(
+        Uri.parse(endpoint),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(zone.toJson()),
+      ).timeout(_normalTimeout),
+      endpoint
+    );
+    return ZoneConfig.fromJson(jsonDecode(response.body) as Map<String, dynamic>);
+  }
+
+  Future<void> deleteCameraZone(String cameraId, String zoneId) async {
+    final endpoint = '$_baseUrl/api/v1/cameras/$cameraId/zones/$zoneId';
+    await _sendRequestWithRetry(
+      () => http.delete(Uri.parse(endpoint)).timeout(_normalTimeout),
+      endpoint
+    );
   }
 }

@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import '../core/theme/app_theme.dart';
+import '../models/camera_feed.dart';
 import '../models/zone_model.dart';
+import '../services/api_service.dart';
 import '../widgets/zone_canvas_painter.dart';
 
 class ZoneEditorScreen extends StatefulWidget {
@@ -11,7 +13,9 @@ class ZoneEditorScreen extends StatefulWidget {
 }
 
 class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
-  String _selectedCamera = 'Camera 01 - Main Gate';
+  List<CameraFeed> _cameras = [];
+  String _selectedCameraId = 'cam_01';
+  bool _isLoading = false;
   ZoneType _selectedTool = ZoneType.intrusion;
   TripwireDirection _tripwireDir = TripwireDirection.bidirectional;
   MaskMode _maskMode = MaskMode.blackout;
@@ -25,7 +29,42 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
   @override
   void initState() {
     super.initState();
-    _loadSampleZones();
+    _loadCamerasAndZones();
+  }
+
+  Future<void> _loadCamerasAndZones() async {
+    setState(() => _isLoading = true);
+    try {
+      final cams = await ApiService().getCameras();
+      setState(() {
+        _cameras = cams;
+        if (cams.isNotEmpty) {
+          _selectedCameraId = cams.first.id;
+        }
+      });
+      await _fetchZonesForSelectedCamera();
+    } catch (e) {
+      _loadSampleZones();
+    } finally {
+      if (mounted) setState(() => _isLoading = false);
+    }
+  }
+
+  Future<void> _fetchZonesForSelectedCamera() async {
+    try {
+      final zones = await ApiService().fetchCameraZones(_selectedCameraId);
+      if (mounted) {
+        setState(() {
+          _savedZones.clear();
+          _savedZones.addAll(zones);
+        });
+      }
+    } catch (e) {
+      // Fall back to sample if offline
+      if (_savedZones.isEmpty) {
+        _loadSampleZones();
+      }
+    }
   }
 
   void _loadSampleZones() {
@@ -69,8 +108,8 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
   void _startNewZone() {
     setState(() {
       _activeDraftZone = ZoneConfig(
-        id: 'draft_${DateTime.now().millisecondsSinceEpoch}',
-        cameraId: 'cam_01',
+        id: 'zone_${DateTime.now().millisecondsSinceEpoch}',
+        cameraId: _selectedCameraId,
         name: 'New ${_selectedTool.name.toUpperCase()} Zone',
         zoneType: _selectedTool,
         direction: _tripwireDir,
@@ -124,16 +163,34 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
     });
   }
 
-  void _saveDraftZone() {
+  Future<void> _saveDraftZone() async {
     if (_activeDraftZone == null) return;
+    final draft = _activeDraftZone!;
     setState(() {
-      _savedZones.add(_activeDraftZone!);
+      _savedZones.add(draft);
       _activeDraftZone = null;
       _selectedVertexIndex = null;
     });
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Zone saved to Edge AI NPU Pipeline'), backgroundColor: AppTheme.liveGreen),
-    );
+
+    try {
+      await ApiService().saveCameraZone(_selectedCameraId, draft);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Zone saved and synchronized with HailoRT AI pipeline'), backgroundColor: AppTheme.liveGreen),
+      );
+    } catch (e) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Saved locally (Offline): $e'), backgroundColor: AppTheme.warningOrange),
+      );
+    }
+  }
+
+  Future<void> _deleteZone(int index) async {
+    final zone = _savedZones[index];
+    setState(() => _savedZones.removeAt(index));
+
+    try {
+      await ApiService().deleteCameraZone(_selectedCameraId, zone.id);
+    } catch (_) {}
   }
 
   Point2D _toNormalized(Offset local, Size size) {
@@ -157,9 +214,10 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
           IconButton(
             tooltip: 'Sync Zones with Backend',
             icon: const Icon(Icons.cloud_upload_outlined, color: AppTheme.cyberBlue),
-            onPressed: () {
+            onPressed: () async {
+              await _fetchZonesForSelectedCamera();
               ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('Synchronized 3 zones with HailoRT edge service.')),
+                SnackBar(content: Text('Synchronized ${_savedZones.length} zones with HailoRT edge service.')),
               );
             },
           ),
@@ -179,7 +237,7 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
                 Padding(
                   padding: const EdgeInsets.all(12),
                   child: DropdownButtonFormField<String>(
-                    value: _selectedCamera,
+                    value: _selectedCameraId,
                     decoration: InputDecoration(
                       labelText: 'Select Camera Stream',
                       filled: true,
@@ -187,10 +245,19 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
                       border: OutlineInputBorder(borderRadius: BorderRadius.circular(8)),
                       contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                     ),
-                    items: ['Camera 01 - Main Gate', 'Camera 02 - Backyard Patio', 'Camera 03 - Warehouse Bay']
-                        .map((c) => DropdownMenuItem(value: c, child: Text(c, style: const TextStyle(fontSize: 12))))
+                    items: (_cameras.isNotEmpty
+                            ? _cameras.map((c) => DropdownMenuItem(value: c.id, child: Text('${c.name} (${c.location})', style: const TextStyle(fontSize: 12))))
+                            : [
+                                const DropdownMenuItem(value: 'cam_01', child: Text('Camera 01 - Main Gate', style: TextStyle(fontSize: 12))),
+                                const DropdownMenuItem(value: 'cam_02', child: Text('Camera 02 - Backyard Patio', style: TextStyle(fontSize: 12))),
+                              ])
                         .toList(),
-                    onChanged: (val) => setState(() => _selectedCamera = val!),
+                    onChanged: (val) {
+                      if (val != null) {
+                        setState(() => _selectedCameraId = val);
+                        _fetchZonesForSelectedCamera();
+                      }
+                    },
                   ),
                 ),
                 const Padding(
@@ -245,9 +312,9 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
                   ),
                 ),
                 const Divider(height: 24, color: AppTheme.borderHighlight),
-                const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
-                  child: Text('CONFIGURED ZONES (3)', style: TextStyle(color: Colors.white54, fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 1)),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  child: Text('CONFIGURED ZONES (${_savedZones.length})', style: const TextStyle(color: Colors.white54, fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 1)),
                 ),
                 Expanded(
                   child: ListView.builder(
@@ -267,7 +334,10 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
                             Switch(
                               value: zone.enabled,
                               activeColor: AppTheme.liveGreen,
-                              onChanged: (val) => setState(() => zone.enabled = val),
+                              onChanged: (val) {
+                                setState(() => zone.enabled = val);
+                                ApiService().saveCameraZone(_selectedCameraId, zone);
+                              },
                             ),
                             const SizedBox(width: 8),
                             Expanded(
@@ -282,7 +352,7 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
                             ),
                             IconButton(
                               icon: const Icon(Icons.delete_outline, size: 18, color: Colors.white38),
-                              onPressed: () => setState(() => _savedZones.removeAt(index)),
+                              onPressed: () => _deleteZone(index),
                             ),
                           ],
                         ),

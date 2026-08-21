@@ -219,9 +219,15 @@ from fastapi import Request
 
 @app.middleware("http")
 async def setup_check_middleware(request: Request, call_next):
-    # Bypass for setup routes, docs, and root
+    # Bypass for setup routes, auth routes, health check, docs, root, and CORS OPTIONS preflights
     path = request.url.path
-    if path.startswith("/api/v1/setup") or path.startswith("/api/v1/auth") or path in ("/", "/docs", "/openapi.json"):
+    if (
+        request.method == "OPTIONS"
+        or path.startswith("/api/v1/setup")
+        or path.startswith("/api/v1/auth")
+        or path.startswith("/api/v1/health")
+        or path in ("/", "/docs", "/openapi.json", "/favicon.ico")
+    ):
         return await call_next(request)
         
     # Check if setup is completed (caching the result to avoid DB hits every request would be better in prod)

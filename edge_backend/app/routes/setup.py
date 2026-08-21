@@ -27,13 +27,23 @@ class ChangePasswordReq(BaseModel):
     new_password: str
     
 class PairReq(BaseModel):
-    pairing_code: str
+    pairing_code: Optional[str] = None
+    code: Optional[str] = None
 
 class TestCameraReq(BaseModel):
     url: str
 
 class ScanNetworkReq(BaseModel):
-    subnet: str
+    subnet: Optional[str] = "192.168.1.0/24"
+
+async def verify_setup_or_admin_access(
+    request: Request,
+    session: AsyncSession = Depends(get_db),
+):
+    is_completed = await setup_service.is_setup_completed(session)
+    if not is_completed:
+        return True
+    return auth_service.verify_api_access(request)
 
 @router.get("/setup/status")
 async def get_setup_status(session: AsyncSession = Depends(get_db)):
@@ -66,25 +76,26 @@ async def create_first_admin(req: AdminCreateReq, session: AsyncSession = Depend
 @router.post("/setup/hardware-scan")
 async def hardware_scan(
     session: AsyncSession = Depends(get_db), 
-    has_access: bool = Depends(auth_service.verify_api_access)
+    has_access: bool = Depends(verify_setup_or_admin_access)
 ):
     hardware = setup_service.detect_hardware()
     return {"hardware": hardware}
 
 @router.post("/setup/camera-scan")
 async def scan_cameras(
-    req: ScanNetworkReq, 
+    req: Optional[ScanNetworkReq] = None, 
     session: AsyncSession = Depends(get_db),
-    has_access: bool = Depends(auth_service.verify_api_access)
+    has_access: bool = Depends(verify_setup_or_admin_access)
 ):
-    results = await setup_service.scan_rtsp_cameras(req.subnet)
+    subnet = req.subnet if req and req.subnet else "192.168.1.0/24"
+    results = await setup_service.scan_rtsp_cameras(subnet)
     return {"cameras": results}
 
 @router.post("/setup/test-camera")
 async def test_camera(
     req: TestCameraReq,
     session: AsyncSession = Depends(get_db),
-    has_access: bool = Depends(auth_service.verify_api_access)
+    has_access: bool = Depends(verify_setup_or_admin_access)
 ):
     result = await setup_service.test_rtsp_url(req.url)
     return result
@@ -92,7 +103,7 @@ async def test_camera(
 @router.post("/setup/add-cameras")
 async def add_cameras(
     session: AsyncSession = Depends(get_db),
-    has_access: bool = Depends(auth_service.verify_api_access)
+    has_access: bool = Depends(verify_setup_or_admin_access)
 ):
     # Stub
     await setup_service.set_setup_step(session, 3)
@@ -101,7 +112,7 @@ async def add_cameras(
 @router.post("/setup/network-config")
 async def save_network_config(
     session: AsyncSession = Depends(get_db),
-    has_access: bool = Depends(auth_service.verify_api_access)
+    has_access: bool = Depends(verify_setup_or_admin_access)
 ):
     # Stub
     await setup_service.set_setup_step(session, 4)
@@ -110,7 +121,7 @@ async def save_network_config(
 @router.post("/setup/notifications")
 async def save_notifications(
     session: AsyncSession = Depends(get_db),
-    has_access: bool = Depends(auth_service.verify_api_access)
+    has_access: bool = Depends(verify_setup_or_admin_access)
 ):
     # Stub
     await setup_service.set_setup_step(session, 5)
@@ -119,7 +130,7 @@ async def save_notifications(
 @router.post("/setup/complete")
 async def complete_setup(
     session: AsyncSession = Depends(get_db),
-    has_access: bool = Depends(auth_service.verify_api_access)
+    has_access: bool = Depends(verify_setup_or_admin_access)
 ):
     await setup_service.complete_setup(session)
     setup_service.generate_secure_secrets()
@@ -159,7 +170,13 @@ async def get_pairing_code(
     return {"pairing_code": code, "expires_in": 300}
 
 @router.post("/auth/pair")
-async def pair_app(req: PairReq):
-    # In reality, this would verify the code from DB and return tokens.
-    # We will just return a dummy token structure for the stub.
-    return {"access_token": "stub_access_token", "refresh_token": "stub_refresh_token"}
+async def pair_app(req: PairReq, session: AsyncSession = Depends(get_db)):
+    code_val = req.pairing_code or req.code
+    if not code_val:
+        raise HTTPException(status_code=400, detail="Missing pairing code")
+
+    tokens = await auth_service.verify_app_pairing_code(session, code_val.strip())
+    if not tokens:
+        raise HTTPException(status_code=401, detail="Invalid or expired 6-digit pairing code")
+
+    return tokens
