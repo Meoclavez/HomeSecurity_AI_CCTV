@@ -72,7 +72,12 @@ class ThreadedVideoIngestWorker:
             start_time = time.time()
 
             while self.is_running:
-                ret, frame = cap.read()
+                try:
+                    ret, frame = cap.read()
+                except Exception as e:
+                    logger.error(f"OpenCV read error for {self.camera_id}: {e}")
+                    ret, frame = False, None
+                
                 if not ret or frame is None:
                     logger.warning(f"RTSP stream dropped for {self.camera_id}. Reconnecting...")
                     break

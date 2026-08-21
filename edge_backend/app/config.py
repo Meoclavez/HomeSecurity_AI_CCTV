@@ -43,7 +43,7 @@ class Settings(BaseSettings):
     HAILO_POSE_HEF_PATH: str = os.getenv("HAILO_POSE_HEF_PATH", "./models_hef/yolov8n_pose.hef")
 
     # Security, JWT & Service Secrets
-    JWT_SECRET: str = os.getenv("JWT_SECRET", secrets.token_hex(32))
+    JWT_SECRET: str = os.getenv("JWT_SECRET", "super_secret_edge_cctv_key_change_in_prod")
     JWT_ALGORITHM: str = "HS256"
     STREAM_TOKEN_EXPIRE_SECONDS: int = 86400  # 24 hours
     STREAM_TOKEN_EXPIRY_SECONDS: int = 86400

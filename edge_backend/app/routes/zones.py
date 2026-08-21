@@ -10,8 +10,13 @@ from app.models.db_models import CameraModel
 from app.models.schemas import ZoneConfig, MuteCameraRequest
 from app.services.ai_zone_service import ai_zone_service
 from datetime import datetime, timedelta
+from app.services.auth_service import auth_service, general_rate_limiter
 
-router = APIRouter(prefix="/api/v1/cameras", tags=["Camera Zones & Privacy"])
+router = APIRouter(
+    prefix="/api/v1/cameras",
+    tags=["Camera Zones & Privacy"],
+    dependencies=[Depends(auth_service.verify_api_access), Depends(general_rate_limiter)]
+)
 
 
 @router.get("/{camera_id}/zones", response_model=List[ZoneConfig])

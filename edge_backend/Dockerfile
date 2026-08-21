@@ -35,6 +35,11 @@ RUN pip3 install --no-cache-dir -r requirements.txt
 COPY app/ /app/app/
 COPY models_hef/ /app/models_hef/
 
+# Create a non-root user and add to video/render groups for VA-API
+RUN groupadd -r appgroup && useradd -r -g appgroup -G video,render appuser
+RUN chown -R appuser:appgroup /app
+USER appuser
+
 EXPOSE 8000
 
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -120,7 +120,7 @@ class SecurityEventBase(BaseModel):
     bounding_box: Optional[BoundingBox] = None
     keypoints: Optional[List[Keypoint]] = None
     kinematics: Optional[KinematicTelemetry] = None
-    metadata: Optional[Dict[str, Any]] = None
+    metadata_json: Optional[Dict[str, Any]] = None
 
 
 class SecurityEventCreate(SecurityEventBase):

@@ -22,7 +22,9 @@ class WebRtcService {
   static const int _maxReconnectAttempts = 5;
 
   Future<void> initialize() async {
-    await renderer.initialize();
+    if (renderer.textureId == null) {
+      await renderer.initialize();
+    }
   }
 
   Future<Map<String, dynamic>> _fetchDynamicIceServers(String baseUrl) async {

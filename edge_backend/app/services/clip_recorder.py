@@ -187,7 +187,7 @@ class ClipRecorderService:
                 "-movflags", "+faststart",
                 str(output_path)
             ]
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True, timeout=60.0)
             if temp_raw_path.exists():
                 temp_raw_path.unlink()
         except Exception as e:

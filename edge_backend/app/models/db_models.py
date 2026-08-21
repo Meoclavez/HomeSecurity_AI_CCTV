@@ -1,6 +1,7 @@
 """SQLAlchemy database models for cameras, security events, push device tokens, DVR segments, and archives."""
 
 from datetime import datetime
+from typing import Optional
 from sqlalchemy import String, Float, Boolean, DateTime, Integer, JSON, ForeignKey, BigInteger, Index
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -29,8 +30,8 @@ class CameraModel(Base):
     dvr_quota_gb: Mapped[float] = mapped_column(Float, default=100.0)
 
     # State & Timestamps
-    muted_until: Mapped[datetime] = mapped_column(DateTime, nullable=True)
-    last_seen: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    muted_until: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    last_seen: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     # Relationships
@@ -56,14 +57,14 @@ class SecurityEventModel(Base):
     severity: Mapped[str] = mapped_column(String(32), nullable=False)
     confidence: Mapped[float] = mapped_column(Float, default=0.0)
     timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    clip_url: Mapped[str] = mapped_column(String(512), nullable=True)
-    snapshot_url: Mapped[str] = mapped_column(String(512), nullable=True)
-    bounding_box: Mapped[dict] = mapped_column(JSON, nullable=True)
-    keypoints: Mapped[list] = mapped_column(JSON, nullable=True)
-    kinematics: Mapped[dict] = mapped_column(JSON, nullable=True)
-    metadata_json: Mapped[dict] = mapped_column(JSON, nullable=True)
+    clip_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    snapshot_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    bounding_box: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    keypoints: Mapped[Optional[list]] = mapped_column(JSON, nullable=True)
+    kinematics: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+    metadata_json: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     acknowledged: Mapped[bool] = mapped_column(Boolean, default=False)
-    acknowledged_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    acknowledged_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     camera: Mapped["CameraModel"] = relationship("CameraModel", back_populates="events")
 
@@ -95,14 +96,14 @@ class IncidentArchiveModel(Base):
     camera_id: Mapped[str] = mapped_column(String(64), ForeignKey("cameras.id", ondelete="CASCADE"), nullable=False, index=True)
     camera_name: Mapped[str] = mapped_column(String(128), nullable=False)
     title: Mapped[str] = mapped_column(String(256), nullable=False)
-    description: Mapped[str] = mapped_column(String(512), nullable=True)
+    description: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     start_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     end_time: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     file_path: Mapped[str] = mapped_column(String(512), nullable=False)
     file_size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
     duration_seconds: Mapped[float] = mapped_column(Float, default=0.0)
     status: Mapped[str] = mapped_column(String(32), default="COMPLETED")
-    download_url: Mapped[str] = mapped_column(String(512), nullable=True)
+    download_url: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
     is_protected: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
@@ -114,6 +115,7 @@ class DeviceTokenModel(Base):
 
     device_token: Mapped[str] = mapped_column(String(256), primary_key=True)
     platform: Mapped[str] = mapped_column(String(32), nullable=False)
-    device_name: Mapped[str] = mapped_column(String(128), nullable=True)
-    app_version: Mapped[str] = mapped_column(String(32), nullable=True)
+    device_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    app_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     last_registered: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+

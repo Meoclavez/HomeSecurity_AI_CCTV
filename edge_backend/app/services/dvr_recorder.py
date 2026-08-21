@@ -344,7 +344,14 @@ class DVRRecorderService:
         ]
 
         logger.info(f"Exporting incident clip {archive_id}: {cmd}")
-        proc = await asyncio.to_thread(subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            proc = await asyncio.to_thread(
+                subprocess.run, cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300.0
+            )
+        except subprocess.TimeoutExpired as e:
+            if temp_concat_file.exists():
+                temp_concat_file.unlink()
+            raise RuntimeError(f"FFmpeg export timed out after 300s: {e}")
 
         if temp_concat_file.exists():
             temp_concat_file.unlink()

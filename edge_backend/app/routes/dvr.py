@@ -23,9 +23,13 @@ from app.models.schemas import (
     StorageHealthResponse
 )
 from app.services.dvr_recorder import dvr_recorder_service
-from app.services.auth_service import auth_service
+from app.services.auth_service import auth_service, general_rate_limiter
 
-router = APIRouter(prefix="/api/v1", tags=["DVR & Timeline"])
+router = APIRouter(
+    prefix="/api/v1",
+    tags=["DVR & Timeline"],
+    dependencies=[Depends(auth_service.verify_api_access), Depends(general_rate_limiter)]
+)
 
 
 # ---------------- 1. 24-Hour Timeline API ----------------

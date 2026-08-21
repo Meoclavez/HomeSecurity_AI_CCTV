@@ -196,8 +196,8 @@ class HailoInferenceService:
             import hailo_platform
             logger.info("HailoRT platform library initialized.")
             self.device_available = True
-        except ImportError:
-            logger.info("HailoRT driver not present on host. Operating in high-precision simulated engine.")
+        except Exception as e:
+            logger.warning(f"HailoRT driver not available or failed to load: {e}. Operating in high-precision simulated engine.")
             self.device_available = False
 
     def process_frame(

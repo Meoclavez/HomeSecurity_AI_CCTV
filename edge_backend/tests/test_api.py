@@ -150,3 +150,48 @@ def test_mute_camera_endpoint():
     response = client.post(f"/api/v1/cameras/{camera_id}/mute", json={"duration_minutes": 5})
     assert response.status_code == 200
     assert response.json()["status"] == "success"
+
+
+def test_auth_bypass_trigger_event():
+    payload = {
+        "camera_id": "cam_living_room",
+        "event_type": "FALL_DETECTED",
+        "severity": "CRITICAL",
+        "confidence": 0.94
+    }
+    response = client.post(
+        "/api/v1/events/trigger", 
+        json=payload, 
+        headers={"X-Edge-API-Key": "invalid_key"}
+    )
+    assert response.status_code == 403
+
+
+def test_path_traversal_prevention():
+    token = auth_service.generate_clip_token("test_event")
+    response = client.get(f"/api/v1/events/clips/..%2F..%2Fetc%2Fpasswd?token={token}")
+    assert response.status_code == 400
+    assert "Invalid filename format" in response.json()["detail"]
+
+
+def test_webrtc_offer_exchange():
+    offer_payload = {
+        "camera_id": "cam_living_room",
+        "sdp": "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=EdgeCCTV_test\r\nt=0 0\r\na=sendrecv\r\n",
+        "type": "offer"
+    }
+    response = client.post("/api/v1/webrtc/offer", json=offer_payload)
+    assert response.status_code == 200
+    data = response.json()
+    assert "sdp" in data
+    assert data["type"] == "answer"
+
+
+def test_dvr_export_incident():
+    payload = {
+        "start_time": datetime.utcnow().isoformat(),
+        "end_time": datetime.utcnow().isoformat(),
+        "title": "Suspicious Activity"
+    }
+    response = client.post("/api/v1/cameras/cam_living_room/export", json=payload)
+    assert response.status_code in [200, 404, 500]

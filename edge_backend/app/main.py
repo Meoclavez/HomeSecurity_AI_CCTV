@@ -132,6 +132,10 @@ async def lifespan(app: FastAPI):
 
     logger.info("Shutting down Edge CCTV Core services...")
     cleaner_task.cancel()
+    try:
+        await cleaner_task
+    except asyncio.CancelledError:
+        pass
     await mdns_advertiser.stop()
     dvr_recorder_service.stop_all()
     await video_ingest_service.stop_all()
@@ -144,10 +148,18 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+if "*" in settings.ALLOWED_CORS_ORIGINS:
+    allow_origins = []
+    allow_origin_regex = ".*"
+else:
+    allow_origins = settings.ALLOWED_CORS_ORIGINS
+    allow_origin_regex = None
+
 # CORS middleware with explicit origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.ALLOWED_CORS_ORIGINS,
+    allow_origins=allow_origins,
+    allow_origin_regex=allow_origin_regex,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Edge-API-Key"],

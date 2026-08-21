@@ -33,6 +33,8 @@ class EdgeDiscoveryService {
   Future<List<DiscoveredEdgeNode>> discoverEdgeServers({
     Duration timeout = const Duration(seconds: 3),
   }) async {
+    if (kIsWeb) return []; // Discovery not supported on Web via dart:io
+    
     final List<DiscoveredEdgeNode> discovered = [];
 
     // 1. Scan via Multicast DNS query on 224.0.0.251:5353

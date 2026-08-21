@@ -122,6 +122,25 @@ class AuthService:
             )
         return True
 
+    def verify_api_access(
+        self,
+        api_key: Optional[str] = Security(api_key_header),
+        bearer: Optional[HTTPAuthorizationCredentials] = Depends(security_bearer)
+    ) -> bool:
+        """General API access for mobile apps / dashboards."""
+        # Check API key first
+        if api_key and secrets.compare_digest(api_key, settings.INTERNAL_SERVICE_KEY):
+            return True
+        # Check bearer token
+        if bearer and self.verify_token(bearer.credentials):
+            return True
+        if settings.DEBUG:
+            return True
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Missing or invalid authentication"
+        )
+
     @staticmethod
     def sanitize_and_resolve_file(base_dir: Path, filename: str) -> Path:
         """Protects against Path Traversal by enforcing strict regex and canonical path containment."""
@@ -148,4 +167,25 @@ class AuthService:
         return target_resolved
 
 
+# Simple Rate Limiter
+from starlette.requests import Request
+from collections import defaultdict
+import time
+
+class RateLimiter:
+    def __init__(self, requests: int, window: int):
+        self.requests = requests
+        self.window = window
+        self.history = defaultdict(list)
+
+    def __call__(self, request: Request):
+        ip = request.client.host if request.client else "unknown"
+        now = time.time()
+        # Clean old
+        self.history[ip] = [t for t in self.history[ip] if now - t < self.window]
+        if len(self.history[ip]) >= self.requests:
+            raise HTTPException(status_code=429, detail="Too Many Requests")
+        self.history[ip].append(now)
+
+general_rate_limiter = RateLimiter(requests=100, window=60)
 auth_service = AuthService()

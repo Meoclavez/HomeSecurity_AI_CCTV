@@ -93,7 +93,7 @@ class ApiService {
         body: jsonEncode({
           'device_token': token,
           'platform': platform,
-          'device_name': Platform.operatingSystem,
+          'device_name': kIsWeb ? 'web' : Platform.operatingSystem,
         }),
       ).timeout(const Duration(seconds: 4));
     } catch (e) {

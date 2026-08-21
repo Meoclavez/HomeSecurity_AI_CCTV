@@ -14,7 +14,13 @@ from app.models.schemas import CameraFeed, CameraListResponse, CameraStatus, Dev
 from app.services.video_ingest_service import video_ingest_service
 from app.services.notification_service import notification_service
 
-router = APIRouter(prefix="/api/v1/cameras", tags=["Cameras"])
+from app.services.auth_service import auth_service, general_rate_limiter
+
+router = APIRouter(
+    prefix="/api/v1/cameras",
+    tags=["Cameras"],
+    dependencies=[Depends(auth_service.verify_api_access), Depends(general_rate_limiter)]
+)
 
 
 @router.get("", response_model=CameraListResponse)

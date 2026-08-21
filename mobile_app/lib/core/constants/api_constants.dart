@@ -8,7 +8,7 @@ class ApiConstants {
   static const String eventsEndpoint = '/api/v1/events';
   static const String triggerEventEndpoint = '/api/v1/events/trigger';
   static const String webrtcOfferEndpoint = '/api/v1/webrtc/offer';
-  static const String webrtcIceEndpoint = '/api/v1/webrtc/ice';
+  static const String webrtcIceEndpoint = '/api/v1/webrtc/ice-servers';
   static const String webrtcTokenEndpoint = '/api/v1/webrtc/token';
   static const String registerDeviceEndpoint = '/api/v1/cameras/register-device';
 

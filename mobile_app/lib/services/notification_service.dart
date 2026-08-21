@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:audioplayers/audioplayers.dart';
@@ -147,17 +148,19 @@ class NotificationService {
     );
 
     // 3. Initialize Platform Notification Channels
-    if (Platform.isAndroid) {
-      try {
-        await _androidChannel.invokeMethod('createEmergencyChannel');
-      } catch (e) {
-        debugPrint('Android emergency channel notice: $e');
-      }
-    } else if (Platform.isIOS) {
-      try {
-        await _iosChannel.invokeMethod('requestCriticalPermissions');
-      } catch (e) {
-        debugPrint('iOS Critical Alert notice: $e');
+    if (!kIsWeb) {
+      if (Platform.isAndroid) {
+        try {
+          await _androidChannel.invokeMethod('createEmergencyChannel');
+        } catch (e) {
+          debugPrint('Android emergency channel notice: $e');
+        }
+      } else if (Platform.isIOS) {
+        try {
+          await _iosChannel.invokeMethod('requestCriticalPermissions');
+        } catch (e) {
+          debugPrint('iOS Critical Alert notice: $e');
+        }
       }
     }
 
@@ -177,7 +180,7 @@ class NotificationService {
         final token = await messaging.getToken();
         if (token != null) {
           debugPrint('FCM Device Token: $token');
-          await ApiService().registerDevice(token, Platform.isIOS ? 'ios' : 'android');
+          await ApiService().registerDevice(token, kIsWeb ? 'web' : (Platform.isIOS ? 'ios' : 'android'));
         }
       }
 
@@ -337,7 +340,7 @@ class NotificationService {
   Future<void> triggerEmergencyTakeover(SecurityEvent event) async {
     await showInteractiveAlert(event: event);
 
-    if (Platform.isAndroid) {
+    if (!kIsWeb && Platform.isAndroid) {
       try {
         await _androidChannel.invokeMethod('wakeScreenForEmergency');
       } catch (e) {
@@ -349,10 +352,12 @@ class NotificationService {
       await _alarmPlayer.setReleaseMode(ReleaseMode.loop);
       await _alarmPlayer.play(AssetSource('sounds/emergency_siren.mp3'));
     } catch (e) {
-      if (Platform.isAndroid) {
-        await _androidChannel.invokeMethod('playFallbackAlarmSound');
-      } else if (Platform.isIOS) {
-        await _iosChannel.invokeMethod('playFallbackAlarmSound');
+      if (!kIsWeb) {
+        if (Platform.isAndroid) {
+          await _androidChannel.invokeMethod('playFallbackAlarmSound');
+        } else if (Platform.isIOS) {
+          await _iosChannel.invokeMethod('playFallbackAlarmSound');
+        }
       }
     }
 
@@ -381,7 +386,7 @@ class NotificationService {
       await _alarmPlayer.stop();
     } catch (_) {}
 
-    if (Platform.isAndroid) {
+    if (!kIsWeb && Platform.isAndroid) {
       try {
         await _androidChannel.invokeMethod('clearEmergencyWakeLock');
       } catch (_) {}

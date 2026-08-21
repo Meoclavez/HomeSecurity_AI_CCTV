@@ -158,6 +158,7 @@ class TrackSpatialState:
     last_position: Tuple[float, float]
     entry_timestamps: Dict[str, float] = field(default_factory=dict)
     last_tripwire_alerts: Dict[str, float] = field(default_factory=dict)
+    last_seen: float = field(default_factory=time.time)
 
 
 class ZoneAnalyticsTracker:
@@ -180,7 +181,7 @@ class ZoneAnalyticsTracker:
         now = time.time()
 
         if now - self.last_cleanup > 5.0:
-            stale_ids = [tid for tid, t in self.tracks.items() if (now - max(t.entry_timestamps.values(), default=0)) > 10.0]
+            stale_ids = [tid for tid, t in self.tracks.items() if (now - t.last_seen) > 10.0]
             for tid in stale_ids:
                 del self.tracks[tid]
             self.last_cleanup = now
@@ -192,12 +193,14 @@ class ZoneAnalyticsTracker:
                 self.tracks[track_id] = TrackSpatialState(
                     track_id=track_id,
                     label=bbox.label,
-                    last_position=curr_pos
+                    last_position=curr_pos,
+                    last_seen=now
                 )
                 prev_pos = curr_pos
             else:
                 prev_pos = self.tracks[track_id].last_position
                 self.tracks[track_id].last_position = curr_pos
+                self.tracks[track_id].last_seen = now
 
             track_state = self.tracks[track_id]
 

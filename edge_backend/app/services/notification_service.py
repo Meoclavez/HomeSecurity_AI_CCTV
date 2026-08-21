@@ -161,6 +161,20 @@ class NotificationService:
             logger.debug(f"[MOCK APNS PUSH] Token: {token} Payload: {json.dumps(payload, indent=2)}")
             return
         logger.info(f"Sending APNs Push to {token[:10]}...")
+        headers = {
+            "apns-topic": settings.APNS_BUNDLE_ID,
+            "apns-push-type": "alert",
+            "apns-priority": "10",
+        }
+        async with httpx.AsyncClient(http2=True) as client:
+            try:
+                # Assuming JWT token generation would happen here
+                resp = await client.post(f"https://api.push.apple.com/3/device/{token}", json=payload, headers=headers)
+                if resp.status_code == 410:
+                    logger.warning(f"Device token {token} is no longer active.")
+                    # TODO: Implement token cleanup
+            except Exception as e:
+                logger.error(f"APNs Push failed: {e}")
 
 
 notification_service = NotificationService()

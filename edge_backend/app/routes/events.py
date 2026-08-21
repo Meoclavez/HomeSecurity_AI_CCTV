@@ -25,10 +25,14 @@ from app.models.schemas import (
 )
 from app.services.clip_recorder import clip_recorder_service
 from app.services.notification_service import notification_service
-from app.services.auth_service import auth_service
+from app.services.auth_service import auth_service, general_rate_limiter
 
 logger = logging.getLogger("EventRoutes")
-router = APIRouter(prefix="/api/v1/events", tags=["Events & Clips"])
+router = APIRouter(
+    prefix="/api/v1/events",
+    tags=["Events & Clips"],
+    dependencies=[Depends(auth_service.verify_api_access), Depends(general_rate_limiter)]
+)
 
 
 @router.post("/trigger", response_model=SecurityEvent)
