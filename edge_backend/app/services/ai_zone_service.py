@@ -498,6 +498,15 @@ class AIZoneService:
         privacy.update_masks(zones)
         self.zone_trackers[camera_id].update_zones(zones)
 
+    load_camera_zones = set_camera_zones
+
+    def get_camera_zones(self, camera_id: str) -> List[ZoneConfig]:
+        self.get_or_create_privacy_engine(camera_id)
+        tracker = self.zone_trackers.get(camera_id)
+        if tracker:
+            return list(tracker.zones.values())
+        return []
+
     def mask_frame(self, camera_id: str, frame: np.ndarray) -> np.ndarray:
         privacy = self.get_or_create_privacy_engine(camera_id)
         return privacy.apply_privacy_masks(frame)

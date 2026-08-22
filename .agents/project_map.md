@@ -87,6 +87,17 @@ Edge_AI_CCTV/
 │   ├── Dockerfile                            # Multi-stage container with HailoRT & VA-API
 │   └── docker-compose.yml                    # Unified stack: coturn, go2rtc, edge_api, caddy, tailscale
 │
+├── esp32_cam_firmware/                       # ESP32-S3 CCTV IP Camera Firmware Suite
+│   ├── esp32_s3_cctv_cam.ino                 # Dual-port anti-overflow MJPEG & Snapshot IP Camera server
+│   ├── camera_pins.h                         # Pinout definitions for Freenove, Seeed XIAO, AI-Thinker S3
+│   ├── platformio.ini                        # PlatformIO build configuration with 8MB OPI PSRAM
+│   └── README.md                             # Firmware flashing and wiring setup guide
+│
+├── scripts/                                  # Testing & Visual Evaluation Suites
+│   ├── monitor_live_ai.py                    # Multi-platform Live AI Monitor with Cyberpunk Web HUD (:8080) & HighGUI
+│   ├── test_local_system.py                  # End-to-end headless pipeline benchmark & DVR verify
+│   └── run_local_test.sh                     # One-click test runner with --gui Web HUD launcher
+│
 └── mobile_app/                               # Cross-Platform Flutter Client (Desktop, Web, Mobile)
     ├── pubspec.yaml                          # Flutter package dependencies (local_auth, webrtc, notifications)
     └── lib/

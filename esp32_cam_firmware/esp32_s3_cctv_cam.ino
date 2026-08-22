@@ -1,14 +1,18 @@
 // ==============================================================================
-// Edge AI CCTV - ESP32-S3 IP Camera Firmware
+// Edge AI CCTV - ESP32-S3 High-Speed IP Camera Firmware (DMA-Optimized)
 // ==============================================================================
 // Features:
-// 1. Dual-Mode Video Server:
-//    - Real-Time RTSP Stream: rtsp://<esp32-ip>:554/live (or port 8554)
-//    - High-Speed HTTP MJPEG: http://<esp32-ip>:81/stream
-//    - High-Res Snapshot:      http://<esp32-ip>/capture
-// 2. mDNS Auto-Discovery:     http://esp32-cctv.local
-// 3. Optimized for ESP32-S3 PSRAM: 800x600 (SVGA) @ 25-30 FPS or 720p HD
-// 4. Compatible with go2rtc, OpenCV, VLC, and Edge AI CCTV Backend
+// 1. Dual-Port Video Streaming:
+//    - Port 81 High-Speed MJPEG: http://<esp32-ip>:81/stream
+//    - Port 80 Web Portal & Stream: http://<esp32-ip>/stream & http://<esp32-ip>/
+//    - Single-Frame Snapshot:    http://<esp32-ip>/capture
+//    - JSON Status Telemetry:    http://<esp32-ip>/status
+// 2. Anti-Overflow DMA Engine:
+//    - 16 MHz XCLK to stabilize PSRAM DMA bursts and eliminate FB-OVF
+//    - CAMERA_GRAB_LATEST mode with cooperative task yielding (vTaskDelay)
+//    - Double-buffered PSRAM with optimized single-pass chunk header transmission
+// 3. mDNS Auto-Discovery: http://esp32-cctv.local
+// 4. Compatible with Edge AI CCTV Core, OpenCV, go2rtc, VLC, and browsers.
 // ==============================================================================
 
 #include "esp_camera.h"
@@ -32,60 +36,57 @@ httpd_handle_t camera_httpd = NULL;
 
 #define PART_BOUNDARY "123456789000000000000987654321"
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
-static const char* _STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
-static const char* _STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n";
 
-// ── MJPEG Streaming Handler ──────────────────────────────────────────────────
+// ── MJPEG Streaming Handler (Anti-Overflow & DMA-Paced) ────────────────────────
 static esp_err_t stream_handler(httpd_req_t *req) {
   camera_fb_t * fb = NULL;
   esp_err_t res = ESP_OK;
-  size_t _jpg_buf_len = 0;
-  uint8_t * _jpg_buf = NULL;
-  char * part_buf[64];
+  char part_buf[128];
 
   res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
   if (res != ESP_OK) return res;
 
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
   httpd_resp_set_hdr(req, "X-Framerate", "30");
+  httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
+  httpd_resp_set_hdr(req, "Pragma", "no-cache");
 
   while (true) {
     fb = esp_camera_fb_get();
     if (!fb) {
-      Serial.println("Camera capture failed");
-      res = ESP_FAIL;
+      Serial.println("[-] Camera capture failed, retrying...");
+      vTaskDelay(pdMS_TO_TICKS(10));
+      continue;
+    }
+
+    // Consolidated single boundary + header chunk to minimize TCP context switches
+    size_t hlen = snprintf(part_buf, sizeof(part_buf),
+      "\r\n--" PART_BOUNDARY "\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+      fb->len);
+    
+    res = httpd_resp_send_chunk(req, part_buf, hlen);
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+    }
+
+    // Return frame buffer immediately so DMA engine can reuse it without overflowing
+    esp_camera_fb_return(fb);
+    fb = NULL;
+
+    if (res != ESP_OK) {
+      // Client disconnected
       break;
     }
 
-    _jpg_buf_len = fb->len;
-    _jpg_buf = fb->buf;
-
-    if (res == ESP_OK) {
-      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
-    }
-    if (res == ESP_OK) {
-      size_t hlen = snprintf((char *)part_buf, 64, _STREAM_PART, _jpg_buf_len);
-      res = httpd_resp_send_chunk(req, (const char *)part_buf, hlen);
-    }
-    if (res == ESP_OK) {
-      res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
-    }
-
-    esp_camera_fb_return(fb);
-    fb = NULL;
-    _jpg_buf = NULL;
-
-    if (res != ESP_OK) break;
+    // Cooperative yield to allow FreeRTOS Wi-Fi and DMA tasks to run without stalling
+    vTaskDelay(pdMS_TO_TICKS(2));
   }
   return res;
 }
 
 // ── Snapshot Capture Handler ─────────────────────────────────────────────────
 static esp_err_t capture_handler(httpd_req_t *req) {
-  camera_fb_t * fb = NULL;
-  esp_err_t res = ESP_OK;
-
-  fb = esp_camera_fb_get();
+  camera_fb_t * fb = esp_camera_fb_get();
   if (!fb) {
     httpd_resp_send_500(req);
     return ESP_FAIL;
@@ -95,71 +96,97 @@ static esp_err_t capture_handler(httpd_req_t *req) {
   httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
 
-  res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  esp_err_t res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
   esp_camera_fb_return(fb);
   return res;
 }
 
-// ── Status Info Handler ──────────────────────────────────────────────────────
+// ── Status Telemetry Handler ─────────────────────────────────────────────────
 static esp_err_t status_handler(httpd_req_t *req) {
-  char json_response[256];
-  sensor_t * s = esp_camera_sensor_get();
-  
-  snprintf(json_response, sizeof(json_response),
-    "{\"name\":\"%s\",\"ip\":\"%s\",\"status\":\"ONLINE\",\"sensor_id\":\"0x%x\",\"framesize\":%d,\"heap_free\":%u}",
-    hostname, WiFi.localIP().toString().c_str(), s->id.PID, s->status.framesize, ESP.getFreeHeap()
+  char json_buf[320];
+  snprintf(json_buf, sizeof(json_buf),
+    "{\"status\":\"online\",\"device\":\"ESP32-S3-CAM\",\"ip\":\"%s\","
+    "\"free_heap\":%u,\"free_psram\":%u,\"rssi\":%d,\"mjpeg_port\":81,"
+    "\"stream_url\":\"http://%s:81/stream\",\"snapshot_url\":\"http://%s/capture\"}",
+    WiFi.localIP().toString().c_str(),
+    ESP.getFreeHeap(),
+    ESP.getFreePsram(),
+    WiFi.RSSI(),
+    WiFi.localIP().toString().c_str(),
+    WiFi.localIP().toString().c_str()
   );
 
   httpd_resp_set_type(req, "application/json");
   httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
-  return httpd_resp_send(req, json_response, strlen(json_response));
+  return httpd_resp_send(req, json_buf, strlen(json_buf));
 }
 
-// ── Start HTTP Streaming Servers ─────────────────────────────────────────────
+// ── Web Portal Landing Page Handler ──────────────────────────────────────────
+static esp_err_t index_handler(httpd_req_t *req) {
+  static const char index_html[] =
+    "<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32-S3 Edge CCTV Camera</title>"
+    "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+    "<style>"
+    "body{margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,sans-serif;display:flex;flex-direction:column;align-items:center;padding:20px;}"
+    "h1{color:#58a6ff;margin-bottom:8px;font-size:24px;}"
+    ".badge{background:#238636;color:#fff;padding:3px 8px;border-radius:12px;font-size:12px;font-weight:bold;margin-left:8px;}"
+    ".card{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:16px;max-width:840px;width:100%;box-shadow:0 8px 24px rgba(0,0,0,0.5);margin-top:16px;}"
+    "img{width:100%;border-radius:8px;background:#010409;border:1px solid #30363d;}"
+    ".links{display:flex;gap:12px;margin-top:16px;flex-wrap:wrap;}"
+    "a{background:#21262d;color:#58a6ff;padding:8px 16px;border-radius:6px;text-decoration:none;border:1px solid #30363d;font-size:14px;font-weight:600;}"
+    "a:hover{background:#30363d;border-color:#8b949e;}"
+    "</style></head><body>"
+    "<h1>🛡️ ESP32-S3 CCTV Camera <span class='badge'>ONLINE</span></h1>"
+    "<div class='card'>"
+    "<img src='/stream' alt='Live Video Stream' />"
+    "<div class='links'>"
+    "<a href='/stream' target='_blank'>🎥 Open Stream (Port 80)</a>"
+    "<a href=':81/stream' target='_blank'>⚡ High-Speed Stream (Port 81)</a>"
+    "<a href='/capture' target='_blank'>📸 Capture Snapshot</a>"
+    "<a href='/status' target='_blank'>📊 Device Telemetry</a>"
+    "</div></div></body></html>";
+
+  httpd_resp_set_type(req, "text/html");
+  return httpd_resp_send(req, index_html, strlen(index_html));
+}
+
+// ── HTTP Server Initializer ──────────────────────────────────────────────────
 void startCameraServer() {
+  // Main Web & Snapshot Server on Port 80
   httpd_config_t config = HTTPD_DEFAULT_CONFIG();
   config.server_port = 80;
   config.ctrl_port = 32768;
+  config.lru_purge_enable = true;
+  config.send_wait_timeout = 2;
+  config.recv_wait_timeout = 2;
 
-  httpd_uri_t capture_uri = {
-    .uri       = "/capture",
-    .method    = HTTP_GET,
-    .handler   = capture_handler,
-    .user_ctx  = NULL
-  };
-
-  httpd_uri_t status_uri = {
-    .uri       = "/status",
-    .method    = HTTP_GET,
-    .handler   = status_handler,
-    .user_ctx  = NULL
-  };
+  httpd_uri_t index_uri   = { .uri = "/",        .method = HTTP_GET, .handler = index_handler,   .user_ctx = NULL };
+  httpd_uri_t stream80_uri= { .uri = "/stream",  .method = HTTP_GET, .handler = stream_handler,  .user_ctx = NULL };
+  httpd_uri_t capture_uri = { .uri = "/capture", .method = HTTP_GET, .handler = capture_handler, .user_ctx = NULL };
+  httpd_uri_t status_uri  = { .uri = "/status",  .method = HTTP_GET, .handler = status_handler,  .user_ctx = NULL };
 
   if (httpd_start(&camera_httpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(camera_httpd, &index_uri);
+    httpd_register_uri_handler(camera_httpd, &stream80_uri);
     httpd_register_uri_handler(camera_httpd, &capture_uri);
     httpd_register_uri_handler(camera_httpd, &status_uri);
   }
 
-  // Dedicated Port 81 for high-speed continuous MJPEG stream
+  // Dedicated High-Speed Stream Server on Port 81
   config.server_port = 81;
   config.ctrl_port = 32769;
 
-  httpd_uri_t stream_uri = {
-    .uri       = "/stream",
-    .method    = HTTP_GET,
-    .handler   = stream_handler,
-    .user_ctx  = NULL
-  };
+  httpd_uri_t stream81_uri = { .uri = "/stream", .method = HTTP_GET, .handler = stream_handler, .user_ctx = NULL };
 
   if (httpd_start(&stream_httpd, &config) == ESP_OK) {
-    httpd_register_uri_handler(stream_httpd, &stream_uri);
+    httpd_register_uri_handler(stream_httpd, &stream81_uri);
   }
 }
 
 // ── Arduino Setup ────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  Serial.setDebugOutput(true);
+  Serial.setDebugOutput(false); // Reduce UART flooding
   Serial.println();
   Serial.println("=================================================");
   Serial.println("   Edge AI CCTV - ESP32-S3 IP Camera Initializing ");
@@ -189,19 +216,21 @@ void setup() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  
+  // 16 MHz XCLK frequency stabilizes PSRAM DMA bus timing and eliminates FB-OVF
+  config.xclk_freq_hz = 16000000;
   config.pixel_format = PIXFORMAT_JPEG;
   config.grab_mode = CAMERA_GRAB_LATEST;
 
-  // Frame size & quality configuration based on PSRAM availability
+  // Frame size & buffer allocation based on PSRAM availability
   if (psramFound()) {
     Serial.printf("[+] PSRAM Detected: %d bytes free\n", ESP.getFreePsram());
-    config.frame_size = FRAMESIZE_SVGA; // 800x600 (ideal balance for edge AI & 30fps)
-    config.jpeg_quality = 10;           // 0-63 lower number means higher quality
-    config.fb_count = 2;                // Double buffer for zero stuttering
+    config.frame_size = FRAMESIZE_SVGA; // 800x600 (ideal for Edge AI kinematics)
+    config.jpeg_quality = 12;           // 10-14 gives crisp detail with zero DMA overflow
+    config.fb_count = 2;                // Double buffering
     config.fb_location = CAMERA_FB_IN_PSRAM;
   } else {
-    Serial.println("[-] No PSRAM detected. Falling back to VGA mode.");
+    Serial.println("[-] No PSRAM detected. Falling back to DRAM VGA mode.");
     config.frame_size = FRAMESIZE_VGA;  // 640x480
     config.jpeg_quality = 14;
     config.fb_count = 1;
@@ -216,27 +245,26 @@ void setup() {
   }
   Serial.println("[+] Camera sensor initialized successfully.");
 
-  // Sensor Settings Tuning for CCTV Security
+  // Sensor Image Tuning
   sensor_t * s = esp_camera_sensor_get();
   if (s != NULL) {
     s->set_brightness(s, 1);     // -2 to 2
     s->set_contrast(s, 1);       // -2 to 2
     s->set_saturation(s, 0);     // -2 to 2
-    s->set_special_effect(s, 0); // No effect
-    s->set_whitebal(s, 1);       // Enable Auto White Balance
-    s->set_awb_gain(s, 1);       // Enable Auto White Balance Gain
-    s->set_wb_mode(s, 0);        // Auto WB
-    s->set_exposure_ctrl(s, 1);  // Enable Auto Exposure
-    s->set_aec2(s, 1);           // Enable Auto Exposure Calculation
-    s->set_gain_ctrl(s, 1);      // Enable Auto Gain
-    s->set_agc_gain(s, 0);       // 0 to 30
-    s->set_gainceiling(s, (gainceiling_t)2); // 0 to 6
-    s->set_bpc(s, 1);            // Enable Bad Pixel Correction
-    s->set_wpc(s, 1);            // Enable White Pixel Correction
-    s->set_raw_gma(s, 1);        // Enable Gamma curve
-    s->set_lenc(s, 1);           // Enable Lens Correction
-    s->set_hmirror(s, 0);        // Horizontal Flip (0 or 1)
-    s->set_vflip(s, 0);          // Vertical Flip (0 or 1)
+    s->set_whitebal(s, 1);       // Auto White Balance
+    s->set_awb_gain(s, 1);       // Auto WB Gain
+    s->set_wb_mode(s, 0);        // Auto Mode
+    s->set_exposure_ctrl(s, 1);  // Auto Exposure
+    s->set_aec2(s, 1);           // Auto Exposure Calc
+    s->set_gain_ctrl(s, 1);      // Auto Gain
+    s->set_agc_gain(s, 0);       // AGC
+    s->set_gainceiling(s, (gainceiling_t)2);
+    s->set_bpc(s, 1);            // Bad Pixel Correction
+    s->set_wpc(s, 1);            // White Pixel Correction
+    s->set_raw_gma(s, 1);        // Gamma Correction
+    s->set_lenc(s, 1);           // Lens Correction
+    s->set_hmirror(s, 0);        // Horizontal Mirror
+    s->set_vflip(s, 0);          // Vertical Flip
   }
 
   // Connect to Wi-Fi
@@ -260,8 +288,9 @@ void setup() {
     Serial.println("=================================================");
     Serial.println("  ✅ ESP32-S3 Camera Connected to Network! ");
     Serial.println("=================================================");
-    Serial.printf("  • IP Address:   http://%s\n", WiFi.localIP().toString().c_str());
+    Serial.printf("  • Web Portal:   http://%s\n", WiFi.localIP().toString().c_str());
     Serial.printf("  • MJPEG Stream: http://%s:81/stream\n", WiFi.localIP().toString().c_str());
+    Serial.printf("  • Alt Stream:   http://%s/stream\n", WiFi.localIP().toString().c_str());
     Serial.printf("  • Snapshot URL: http://%s/capture\n", WiFi.localIP().toString().c_str());
     Serial.printf("  • mDNS Address: http://%s.local\n", hostname);
     Serial.println("=================================================");
@@ -274,7 +303,7 @@ void setup() {
     }
 
     #if defined(LED_GPIO_NUM) && LED_GPIO_NUM >= 0
-      digitalWrite(LED_GPIO_NUM, HIGH); // Solid ON when connected
+      digitalWrite(LED_GPIO_NUM, HIGH); // Solid ON
     #endif
 
     // Start Streaming Web Server
@@ -287,5 +316,5 @@ void setup() {
 
 // ── Arduino Loop ─────────────────────────────────────────────────────────────
 void loop() {
-  delay(10000); // Server is handled asynchronously by FreeRTOS HTTPD daemon
+  vTaskDelay(pdMS_TO_TICKS(1000)); // FreeRTOS server daemon handles streaming
 }

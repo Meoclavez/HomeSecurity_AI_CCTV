@@ -32,7 +32,7 @@ source "$VENV_DIR/bin/activate"
 echo "[+] Checking Python test dependencies..."
 pip install --quiet --upgrade pip
 pip install --quiet \
-    opencv-python-headless \
+    opencv-python \
     numpy \
     pydantic \
     pydantic-settings \
@@ -43,7 +43,7 @@ pip install --quiet \
     pyjwt \
     passlib \
     bcrypt \
-    httpx
+    httpx || pip install --quiet opencv-python-headless
 
 # 3. Parse Custom Stream URL or GUI Flag
 IS_GUI=false
@@ -58,7 +58,8 @@ for arg in "$@"; do
 done
 
 if [ "$IS_GUI" = true ]; then
-  echo "[+] Launching Real-Time Live AI Vision Monitor & Performance HUD..."
+  echo "[+] Launching Real-Time Live AI Vision Monitor & Web HUD..."
+  echo "    🌐 Access the Live CCTV Dashboard at: http://localhost:8080"
   if [ -n "$STREAM_URL" ]; then
     python3 "$PROJECT_ROOT/scripts/monitor_live_ai.py" --stream "$STREAM_URL"
   else
@@ -76,7 +77,7 @@ else
 fi
 
 echo "======================================================="
-echo " ✅ Test finished! Recorded clips are saved in:"
+echo " ✅ Test completed! Recorded clips are saved in:"
 echo "    • $PROJECT_ROOT/storage/clips/"
 echo "    • $PROJECT_ROOT/storage/dvr/"
 echo "======================================================="
