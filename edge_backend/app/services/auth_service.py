@@ -242,18 +242,26 @@ class AuthService:
         ip = request.client.host if request.client else "unknown"
         intrusion_detector.check_lockout(ip)
         
-        # Check API key first
-        if api_key and secrets.compare_digest(api_key, settings.INTERNAL_SERVICE_KEY):
+        # Safely resolve API key from dependency or request header
+        resolved_api_key = api_key if isinstance(api_key, str) else request.headers.get("X-Edge-API-Key")
+        if resolved_api_key and secrets.compare_digest(resolved_api_key, settings.INTERNAL_SERVICE_KEY):
             intrusion_detector.record_success(ip, "api_key")
             return True
-        # Check bearer token
-        if bearer:
-            payload = self.verify_token(bearer.credentials)
+
+        # Safely resolve bearer token from dependency or Authorization header
+        raw_bearer = bearer.credentials if isinstance(bearer, HTTPAuthorizationCredentials) else None
+        if not raw_bearer:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                raw_bearer = auth_header.split(" ", 1)[1]
+
+        if raw_bearer:
+            payload = self.verify_token(raw_bearer)
             if payload and payload.get("type") in ("user_session", "stream_access", "clip_access"):
                 intrusion_detector.record_success(ip, "bearer_token")
-                # Attach payload to request state for downstream use
                 request.state.user = payload
                 return True
+
         if settings.DEBUG:
             return True
         intrusion_detector.record_failure(ip)
