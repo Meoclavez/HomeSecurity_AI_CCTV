@@ -257,8 +257,8 @@ def test_setup_status_endpoint(client):
     assert "hardware_report" in data
 
 
-def test_setup_hardware_scan(client):
-    response = client.post("/api/v1/setup/hardware-scan")
+def test_setup_hardware_scan(client, auth_headers):
+    response = client.post("/api/v1/setup/hardware-scan", headers=auth_headers)
     assert response.status_code == 200
     data = response.json()
     assert "hardware" in data
