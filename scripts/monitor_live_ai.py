@@ -647,8 +647,11 @@ class LiveAIMonitor:
         # Ring Buffer for Clips
         self.ring_buffer = clip_recorder_service.get_or_create_buffer(self.camera_id)
 
-        # Initialize Default Security Zones
-        self._init_default_zones()
+        # Persistent Storage Path
+        self.zones_file = PROJECT_ROOT / "storage" / "zones_config.json"
+
+        # Initialize Security Zones (from disk if available, or default)
+        self._init_zones()
 
     def _init_default_zones(self):
         self.tripwire_config = {
@@ -672,7 +675,48 @@ class LiveAIMonitor:
             ],
             "enabled": True
         }
+        self._save_persistent_zones()
         self.sync_zones_to_service()
+
+    def _init_zones(self):
+        if self.zones_file.exists():
+            try:
+                with open(self.zones_file, "r") as f:
+                    saved = json.load(f)
+                    if "tripwire" in saved and "x1" in saved["tripwire"]:
+                        self.tripwire_config = saved["tripwire"]
+                    else:
+                        self.tripwire_config = {
+                            "id": "zone_tripwire_gate", "name": "Virtual Tripwire",
+                            "x1": 0.15, "y1": 0.55, "x2": 0.85, "y2": 0.55, "direction": "BIDIRECTIONAL", "enabled": True
+                        }
+
+                    if "intrusion" in saved and "points" in saved["intrusion"]:
+                        self.intrusion_config = saved["intrusion"]
+                    else:
+                        self.intrusion_config = {
+                            "id": "zone_intrusion_porch", "name": "Restricted Intrusion Zone",
+                            "points": [{"x": 0.55, "y": 0.25}, {"x": 0.95, "y": 0.25}, {"x": 0.95, "y": 0.85}, {"x": 0.55, "y": 0.85}], "enabled": True
+                        }
+                logger.info(f"✅ Loaded persistent security zones from: {self.zones_file.name}")
+                self.sync_zones_to_service()
+                return
+            except Exception as e:
+                logger.warning(f"Could not load saved zones ({e}). Using defaults.")
+
+        self._init_default_zones()
+
+    def _save_persistent_zones(self):
+        try:
+            self.zones_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.zones_file, "w") as f:
+                json.dump({
+                    "tripwire": self.tripwire_config,
+                    "intrusion": self.intrusion_config
+                }, f, indent=2)
+            logger.info("💾 Security zones persisted to storage/zones_config.json")
+        except Exception as e:
+            logger.error(f"Failed to persist security zones: {e}")
 
     def sync_zones_to_service(self):
         zones = []
@@ -705,7 +749,7 @@ class LiveAIMonitor:
                 enabled=True,
                 allowed_classes=["person"],
                 polygon_points=pts,
-                dwell_time_seconds=1.0
+                dwell_time_seconds=0.5
             ))
 
         ai_zone_service.set_camera_zones(self.camera_id, zones)
@@ -735,11 +779,13 @@ class LiveAIMonitor:
             "y2": max(0.0, min(1.0, y2)),
             "direction": direction
         })
+        self._save_persistent_zones()
         self.sync_zones_to_service()
         self.trigger_alert(f"Tripwire repositioned: ({x1:.2f},{y1:.2f}) -> ({x2:.2f},{y2:.2f}) [{direction}]", "ZONE_CONFIG", duration=2.5)
 
     def update_intrusion_zone(self, points: List[Dict[str, float]]):
         self.intrusion_config["points"] = points
+        self._save_persistent_zones()
         self.sync_zones_to_service()
         self.trigger_alert(f"Intrusion zone updated with {len(points)} vertices.", "ZONE_CONFIG", duration=2.5)
 
@@ -1608,15 +1654,23 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             "events": recent_events
         }
 
+    @web_app.get("/api/zones")
+    async def get_zones():
+        return {
+            "status": "ok",
+            "tripwire": monitor.tripwire_config,
+            "intrusion": monitor.intrusion_config
+        }
+
     @web_app.post("/api/zone/tripwire")
     async def set_tripwire(req: TripwireReq):
         monitor.update_tripwire_position(req.x1, req.y1, req.x2, req.y2, req.direction)
-        return {"status": "ok", "message": "Tripwire configuration updated"}
+        return {"status": "ok", "message": "Tripwire configuration updated and saved persistently"}
 
     @web_app.post("/api/zone/intrusion")
     async def set_intrusion(req: IntrusionReq):
         monitor.update_intrusion_zone(req.points)
-        return {"status": "ok", "message": "Intrusion zone configuration updated"}
+        return {"status": "ok", "message": "Intrusion zone configuration updated and saved persistently"}
 
     @web_app.post("/api/action/snapshot")
     async def take_snapshot():

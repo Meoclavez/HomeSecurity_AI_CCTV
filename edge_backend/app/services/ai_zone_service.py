@@ -78,14 +78,22 @@ class PolygonGeometry:
             elif d1 < 0 and d2 > 0:
                 return TripwireDirection.B_TO_A
 
-        return None
-
     @staticmethod
-    def get_bbox_footprint(bbox: BoundingBox) -> Tuple[float, float]:
-        """Calculates ground plane contact footprint (bottom-center point of bounding box)."""
-        footprint_x = (bbox.x_min + bbox.x_max) / 2.0
-        footprint_y = bbox.y_max
-        return (footprint_x, footprint_y)
+    def is_bbox_in_polygon(bbox: BoundingBox, polygon: List[Tuple[float, float]]) -> bool:
+        """Checks if any anatomical body point (feet, centroid, torso, chest) is inside the polygon."""
+        cx = (bbox.x_min + bbox.x_max) / 2.0
+        points_to_check = [
+            (cx, bbox.y_max),                                         # Feet / footprint
+            (cx, (bbox.y_min + bbox.y_max) / 2.0),                   # Centroid
+            (cx, bbox.y_min + 0.75 * (bbox.y_max - bbox.y_min)),     # Lower torso / waist
+            (cx, bbox.y_min + 0.25 * (bbox.y_max - bbox.y_min)),     # Upper torso / chest
+            (bbox.x_min, bbox.y_max),                                 # Bottom left
+            (bbox.x_max, bbox.y_max),                                 # Bottom right
+        ]
+        for pt in points_to_check:
+            if PolygonGeometry.point_in_polygon_raycasting(pt, polygon):
+                return True
+        return False
 
 
 # ---------------- 2. Privacy Masking Engine ----------------
@@ -173,6 +181,7 @@ class TrackSpatialState:
     last_bbox: Optional[BoundingBox] = None
     entry_timestamps: Dict[str, float] = field(default_factory=dict)
     last_tripwire_alerts: Dict[str, float] = field(default_factory=dict)
+    last_intrusion_alerts: Dict[str, float] = field(default_factory=dict)
     last_seen: float = field(default_factory=time.time)
 
 
@@ -205,7 +214,7 @@ class ZoneAnalyticsTracker:
 
             for track_id, bbox in detections:
                 try:
-                    curr_pos = PolygonGeometry.get_bbox_footprint(bbox)
+                    curr_pos = ((bbox.x_min + bbox.x_max) / 2.0, bbox.y_max)
                 except Exception as e:
                     logger.warning(f"Failed to get footprint for track {track_id}: {e}")
                     continue
@@ -300,7 +309,7 @@ class ZoneAnalyticsTracker:
                         if len(zone.polygon_points) < 3:
                             continue
                         poly = [(p.x, p.y) for p in zone.polygon_points]
-                        is_inside = PolygonGeometry.point_in_polygon_raycasting(curr_pos, poly)
+                        is_inside = PolygonGeometry.is_bbox_in_polygon(bbox, poly)
 
                         if is_inside:
                             if zone_id not in track_state.entry_timestamps:
@@ -308,7 +317,9 @@ class ZoneAnalyticsTracker:
 
                             dwell_time = now - track_state.entry_timestamps[zone_id]
                             if dwell_time >= zone.dwell_time_seconds:
-                                if dwell_time - zone.dwell_time_seconds < 1.0:
+                                last_alert = track_state.last_intrusion_alerts.get(zone_id, 0.0)
+                                if (now - last_alert) >= 2.5:
+                                    track_state.last_intrusion_alerts[zone_id] = now
                                     events.append(
                                         SecurityEventCreate(
                                             camera_id=self.camera_id,
@@ -327,6 +338,7 @@ class ZoneAnalyticsTracker:
                                     )
                         else:
                             track_state.entry_timestamps.pop(zone_id, None)
+                            track_state.last_intrusion_alerts.pop(zone_id, None)
                     except Exception as e:
                         logger.error(f"Error evaluating polygon intrusion zone {zone_id}: {e}")
                         continue
