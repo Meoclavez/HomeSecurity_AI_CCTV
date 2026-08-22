@@ -65,7 +65,10 @@ class EdgeMDNSAdvertiser:
             self.aiozc = AsyncZeroconf(ip_version=IPVersion.V4Only)
             self.service_info = self._build_service_info(lan_ip)
 
-            await self.aiozc.register_service(self.service_info)
+            if hasattr(self.aiozc, "async_register_service"):
+                await self.aiozc.async_register_service(self.service_info)
+            else:
+                await self.aiozc.register_service(self.service_info)
             logger.info("mDNS service '_cctv-edge._tcp.local.' broadcast active.")
 
             # Start background IP monitor
@@ -83,28 +86,25 @@ class EdgeMDNSAdvertiser:
 
                 if new_ip != self._current_ip and new_ip != "127.0.0.1":
                     logger.warning(
-                        f"LAN IP changed: {self._current_ip} → {new_ip}. Re-registering mDNS..."
+                        f"LAN IP changed ({self._current_ip} -> {new_ip})! Re-registering mDNS..."
                     )
-
-                    # Unregister old service
-                    if self.service_info and self.aiozc:
-                        try:
+                    if self.aiozc and self.service_info:
+                        if hasattr(self.aiozc, "async_unregister_service"):
+                            await self.aiozc.async_unregister_service(self.service_info)
+                        else:
                             await self.aiozc.unregister_service(self.service_info)
-                        except Exception as e:
-                            logger.warning(f"Failed to unregister old mDNS: {e}")
-
-                    # Register with new IP
+                    
                     self._current_ip = new_ip
                     self.service_info = self._build_service_info(new_ip)
-                    await self.aiozc.register_service(self.service_info)
-                    logger.info(f"mDNS re-registered at new IP: {new_ip}")
-
+                    if hasattr(self.aiozc, "async_register_service"):
+                        await self.aiozc.async_register_service(self.service_info)
+                    else:
+                        await self.aiozc.register_service(self.service_info)
+                    logger.info(f"mDNS service re-registered with new IP: {new_ip}")
             except asyncio.CancelledError:
-                logger.info("mDNS IP monitor stopped.")
                 break
-            except Exception as e:
-                logger.error(f"mDNS IP monitor error: {e}")
-                await asyncio.sleep(IP_CHECK_INTERVAL_SECONDS)
+            except Exception as err:
+                logger.error(f"Error during mDNS IP check: {err}")
 
     async def stop(self):
         """Cancel IP monitor and unregister mDNS service cleanly upon server shutdown."""
@@ -119,8 +119,14 @@ class EdgeMDNSAdvertiser:
         if self.aiozc and self.service_info:
             try:
                 logger.info("Unregistering mDNS service...")
-                await self.aiozc.unregister_service(self.service_info)
-                await self.aiozc.close()
+                if hasattr(self.aiozc, "async_unregister_service"):
+                    await self.aiozc.async_unregister_service(self.service_info)
+                else:
+                    await self.aiozc.unregister_service(self.service_info)
+                if hasattr(self.aiozc, "async_close"):
+                    await self.aiozc.async_close()
+                else:
+                    await self.aiozc.close()
                 logger.info("mDNS service stopped cleanly.")
             except Exception as e:
                 logger.warning(f"Error stopping mDNS: {e}")

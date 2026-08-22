@@ -21,35 +21,53 @@ class CircuitBreaker:
     OPEN = "OPEN"
     HALF_OPEN = "HALF_OPEN"
 
-    def __init__(self, failure_threshold: int = 5, cooldown_seconds: int = 30, name: str = "CircuitBreaker"):
-        self.failure_threshold = failure_threshold
-        self.cooldown_seconds = cooldown_seconds
-        self.name = name
+    def __init__(self, name: str = "CircuitBreaker", failure_threshold: int = 5, cooldown_seconds: int = 30, recovery_timeout: Optional[float] = None, **kwargs):
+        if isinstance(name, int):
+            self.failure_threshold = name
+            self.name = kwargs.get("name", "CircuitBreaker")
+        else:
+            self.name = name
+            self.failure_threshold = failure_threshold
+        self.cooldown_seconds = int(recovery_timeout) if recovery_timeout is not None else cooldown_seconds
         self.state = self.CLOSED
         self.failures = 0
         self.last_failure_time = 0.0
 
-    async def __aenter__(self):
+    def can_execute(self) -> bool:
+        """Check if execution is permitted under the current circuit state."""
         if self.state == self.OPEN:
             if time.time() - self.last_failure_time > self.cooldown_seconds:
                 self.state = self.HALF_OPEN
                 logging.info(f"[{self.name}] Circuit half-open, probing...")
-            else:
-                raise Exception(f"[{self.name}] Circuit is OPEN. Request rejected.")
+                return True
+            return False
+        return True
+
+    def record_success(self):
+        """Record successful execution and close the circuit."""
+        if self.state == self.HALF_OPEN:
+            logging.info(f"[{self.name}] Circuit recovered, closed.")
+        self.state = self.CLOSED
+        self.failures = 0
+
+    def record_failure(self):
+        """Record failure and trip circuit to OPEN if threshold exceeded."""
+        self.failures += 1
+        self.last_failure_time = time.time()
+        if self.failures >= self.failure_threshold and self.state != self.OPEN:
+            self.state = self.OPEN
+            logging.warning(f"[{self.name}] Circuit tripped to OPEN (threshold {self.failure_threshold} reached).")
+
+    async def __aenter__(self):
+        if not self.can_execute():
+            raise Exception(f"[{self.name}] Circuit is OPEN. Request rejected.")
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if exc_type is not None:
-            self.failures += 1
-            self.last_failure_time = time.time()
-            if self.failures >= self.failure_threshold and self.state != self.OPEN:
-                self.state = self.OPEN
-                logging.warning(f"[{self.name}] Circuit tripped to OPEN due to {exc_type.__name__}.")
+            self.record_failure()
         else:
-            if self.state == self.HALF_OPEN:
-                self.state = self.CLOSED
-                logging.info(f"[{self.name}] Circuit recovered, closed.")
-            self.failures = 0
+            self.record_success()
         return False
 
     def __call__(self, func: Callable) -> Callable:
@@ -121,28 +139,28 @@ class ServiceHealthTracker:
             "consecutive_failures": 0
         }
 
+    @classmethod
+    def report_status(cls, service_name: str, status_str: str, message: Optional[str] = None):
+        """Classmethod helper to report subsystem health status."""
+        instance = cls()
+        if service_name not in instance.services:
+            instance.services[service_name] = instance._default_status()
+        s = instance.services[service_name]
+        s["status"] = status_str.upper()
+        if message:
+            s["last_error"] = message
+        if status_str.lower() in ("healthy", "ok"):
+            s["last_success_time"] = time.time()
+            s["consecutive_failures"] = 0
+            s["last_error"] = None
+        else:
+            s["consecutive_failures"] = s.get("consecutive_failures", 0) + 1
+
     def record_success(self, service_name: str):
-        if service_name not in self.services:
-            self.services[service_name] = self._default_status()
-            
-        s = self.services[service_name]
-        s["status"] = self.HEALTHY
-        s["last_success_time"] = time.time()
-        s["consecutive_failures"] = 0
-        s["last_error"] = None
+        self.report_status(service_name, self.HEALTHY)
 
     def record_failure(self, service_name: str, error: str):
-        if service_name not in self.services:
-            self.services[service_name] = self._default_status()
-            
-        s = self.services[service_name]
-        s["consecutive_failures"] += 1
-        s["last_error"] = str(error)
-        
-        if s["consecutive_failures"] >= 3:
-            s["status"] = self.FAILED
-        else:
-            s["status"] = self.DEGRADED
+        self.report_status(service_name, self.DEGRADED, error)
 
     def get_system_health_report(self) -> Dict[str, Any]:
         return {

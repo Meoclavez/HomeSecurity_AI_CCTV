@@ -117,6 +117,14 @@ class AuthService:
         }
         return jwt.encode(payload, self.secret, algorithm=self.algorithm)
 
+    def create_access_token(self, data: dict, expires_delta: Optional[int] = None) -> str:
+        """Create a signed JWT session/access token."""
+        to_encode = data.copy()
+        now = int(time.time())
+        expire = now + (expires_delta if expires_delta else (24 * 3600))
+        to_encode.update({"iat": now, "exp": expire, "type": data.get("type", "user_session")})
+        return jwt.encode(to_encode, self.secret, algorithm=self.algorithm)
+
     def generate_clip_token(self, event_id: str) -> str:
         """Generate a signed expiring token for downloading/streaming event clips."""
         payload = {
