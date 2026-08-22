@@ -202,6 +202,10 @@ class HailoInferenceService:
             logger.warning(f"HailoRT driver not available or failed to load: {e}. Operating in high-precision simulated engine.")
             self.device_available = False
 
+    @property
+    def is_simulated(self) -> bool:
+        return not self.device_available
+
     def process_frame(
         self,
         camera_id: str,
