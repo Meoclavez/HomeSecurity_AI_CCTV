@@ -100,14 +100,52 @@ async def test_camera(
     result = await setup_service.test_rtsp_url(req.url)
     return result
 
+class CameraSetupItem(BaseModel):
+    name: str
+    location: str
+    rtsp_url: str
+
+class AddCamerasReq(BaseModel):
+    cameras: List[CameraSetupItem]
+
 @router.post("/setup/add-cameras")
 async def add_cameras(
+    req: AddCamerasReq,
     session: AsyncSession = Depends(get_db),
     has_access: bool = Depends(verify_setup_or_admin_access)
 ):
-    # Stub
+    from app.models.db_models import CameraModel
+    from app.services.video_ingest_service import video_ingest_service
+    import uuid
+
+    added = []
+    for idx, c in enumerate(req.cameras):
+        cam_id = f"cam_{uuid.uuid4().hex[:8]}"
+        webrtc_url = f"{settings.EDGE_BASE_URL}/api/v1/webrtc/offer?camera_id={cam_id}"
+
+        db_cam = CameraModel(
+            id=cam_id,
+            name=c.name,
+            location=c.location,
+            rtsp_url=c.rtsp_url,
+            webrtc_url=webrtc_url,
+            status="ONLINE",
+            fps=25,
+            resolution="1920x1080",
+            is_ai_enabled=True,
+            ai_models=["yolov8n", "yolov8n_pose"],
+            dvr_enabled=True,
+            dvr_retention_days=7,
+            dvr_quota_gb=100.0,
+        )
+        session.add(db_cam)
+        added.append(cam_id)
+        # Register and start video ingest worker
+        await video_ingest_service.register_and_start_camera(cam_id, c.rtsp_url)
+
+    await session.commit()
     await setup_service.set_setup_step(session, 3)
-    return {"status": "success"}
+    return {"status": "success", "added_cameras": added}
 
 @router.post("/setup/network-config")
 async def save_network_config(

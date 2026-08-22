@@ -99,6 +99,8 @@ class _MultiCamGridScreenState extends State<MultiCamGridScreen> {
   }
 
   Widget _buildCameraTile(CameraFeed camera) {
+    final bool isOffline = !camera.isOnline;
+
     return InkWell(
       onTap: () {
         Navigator.push(
@@ -111,7 +113,9 @@ class _MultiCamGridScreenState extends State<MultiCamGridScreen> {
         decoration: BoxDecoration(
           color: AppTheme.cardSurface,
           borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: AppTheme.borderHighlight),
+          border: Border.all(
+            color: isOffline ? AppTheme.warningOrange.withOpacity(0.5) : AppTheme.borderHighlight,
+          ),
         ),
         clipBehavior: Clip.antiAlias,
         child: Stack(
@@ -120,12 +124,55 @@ class _MultiCamGridScreenState extends State<MultiCamGridScreen> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const Icon(Icons.videocam_outlined, color: Colors.white24, size: 48),
-                  const SizedBox(height: 8),
-                  Text(
-                    'Tap for <300ms WebRTC Stream',
-                    style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 11),
+                  Icon(
+                    isOffline ? Icons.videocam_off_outlined : Icons.videocam_outlined,
+                    color: isOffline ? AppTheme.warningOrange.withOpacity(0.6) : Colors.white24,
+                    size: 44,
                   ),
+                  const SizedBox(height: 8),
+                  if (isOffline) ...[
+                    Text(
+                      camera.errorMessage ?? 'Camera Connection Lost',
+                      style: const TextStyle(color: AppTheme.warningOrange, fontSize: 11, fontWeight: FontWeight.bold),
+                      textAlign: TextAlign.center,
+                    ),
+                    const SizedBox(height: 6),
+                    ElevatedButton.icon(
+                      onPressed: () async {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(content: Text('Scanning subnets for ${camera.name}...')),
+                        );
+                        try {
+                          final res = await _apiService.triggerAutoRecover(camera.id);
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(res['message'] ?? 'Scan complete'),
+                              backgroundColor: res['status'] == 'success' ? AppTheme.liveGreen : AppTheme.warningOrange,
+                            ),
+                          );
+                          _loadCameras();
+                        } catch (e) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(content: Text('Recovery failed: $e'), backgroundColor: AppTheme.emergencyRed),
+                          );
+                        }
+                      },
+                      icon: const Icon(Icons.autorenew_rounded, size: 14),
+                      label: const Text('Auto-Recover IP', style: TextStyle(fontSize: 10)),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: AppTheme.cyberBlue,
+                        foregroundColor: Colors.black,
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                        minimumSize: Size.zero,
+                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                    ),
+                  ] else ...[
+                    Text(
+                      'Tap for <300ms WebRTC Stream',
+                      style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 11),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -140,7 +187,14 @@ class _MultiCamGridScreenState extends State<MultiCamGridScreen> {
                 ),
                 child: Row(
                   children: [
-                    Container(width: 8, height: 8, decoration: const BoxDecoration(color: AppTheme.liveGreen, shape: BoxShape.circle)),
+                    Container(
+                      width: 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        color: isOffline ? AppTheme.warningOrange : AppTheme.liveGreen,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
                     const SizedBox(width: 6),
                     Text(camera.name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11)),
                   ],
@@ -158,11 +212,20 @@ class _MultiCamGridScreenState extends State<MultiCamGridScreen> {
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                     decoration: BoxDecoration(
-                      color: AppTheme.cyberBlue.withOpacity(0.15),
+                      color: isOffline ? AppTheme.warningOrange.withOpacity(0.15) : AppTheme.cyberBlue.withOpacity(0.15),
                       borderRadius: BorderRadius.circular(4),
-                      border: Border.all(color: AppTheme.cyberBlue.withOpacity(0.4)),
+                      border: Border.all(
+                        color: isOffline ? AppTheme.warningOrange.withOpacity(0.4) : AppTheme.cyberBlue.withOpacity(0.4),
+                      ),
                     ),
-                    child: const Text('HAILO AI ACTIVE', style: TextStyle(color: AppTheme.cyberBlue, fontSize: 9, fontWeight: FontWeight.bold)),
+                    child: Text(
+                      isOffline ? 'OFFLINE' : 'HAILO AI ACTIVE',
+                      style: TextStyle(
+                        color: isOffline ? AppTheme.warningOrange : AppTheme.cyberBlue,
+                        fontSize: 9,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                   ),
                 ],
               ),

@@ -10,6 +10,10 @@ class CameraFeed {
   final bool isAiEnabled;
   final List<String> aiModels;
 
+  final String? diagnosticState;
+  final String? errorMessage;
+  final bool isAutoRecovering;
+
   CameraFeed({
     required this.id,
     required this.name,
@@ -21,6 +25,9 @@ class CameraFeed {
     required this.resolution,
     required this.isAiEnabled,
     required this.aiModels,
+    this.diagnosticState,
+    this.errorMessage,
+    this.isAutoRecovering = false,
   });
 
   factory CameraFeed.fromJson(Map<String, dynamic> json) {
@@ -35,6 +42,9 @@ class CameraFeed {
       resolution: json['resolution'] ?? '1920x1080',
       isAiEnabled: json['is_ai_enabled'] ?? true,
       aiModels: List<String>.from(json['ai_models'] ?? []),
+      diagnosticState: json['diagnostic_state'],
+      errorMessage: json['error_message'],
+      isAutoRecovering: json['is_auto_recovering'] ?? false,
     );
   }
 

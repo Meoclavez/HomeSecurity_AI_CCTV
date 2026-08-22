@@ -94,6 +94,26 @@ class _SetupWizardScreenState extends State<SetupWizardScreen> {
     setState(() => _isLoading = false);
   }
 
+  Future<void> _saveDiscoveredCameras() async {
+    if (_cameras.isEmpty) return;
+    try {
+      final payload = {
+        'cameras': _cameras.map((c) => {
+          'name': c['name'] ?? 'Discovered IP Camera',
+          'location': c['location'] ?? 'Default Location',
+          'rtsp_url': c['url'] ?? '',
+        }).toList(),
+      };
+      await http.post(
+        Uri.parse('${_serverUrlController.text}/api/v1/setup/add-cameras'),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode(payload),
+      );
+    } catch (e) {
+      debugPrint('Error saving discovered cameras: $e');
+    }
+  }
+
   Future<void> _completeSetup() async {
     setState(() => _isLoading = true);
     try {
@@ -126,7 +146,10 @@ class _SetupWizardScreenState extends State<SetupWizardScreen> {
             _currentStep++;
             _scanCameras();
           }
-          else if (_currentStep == 3) _currentStep++;
+          else if (_currentStep == 3) {
+            _saveDiscoveredCameras();
+            _currentStep++;
+          }
           else if (_currentStep == 4) _currentStep++;
           else if (_currentStep == 5) _completeSetup();
         },

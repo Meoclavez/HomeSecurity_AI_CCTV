@@ -275,4 +275,32 @@ class ApiService {
       endpoint
     );
   }
+
+  Future<Map<String, dynamic>> diagnoseCamera(String cameraId) async {
+    final endpoint = '$_baseUrl/api/v1/cameras/$cameraId/diagnostics';
+    final response = await _sendRequestWithRetry(
+      () => http.get(Uri.parse(endpoint)).timeout(_normalTimeout),
+      endpoint
+    );
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> triggerAutoRecover(String cameraId) async {
+    final endpoint = '$_baseUrl/api/v1/cameras/$cameraId/auto-recover';
+    final response = await _sendRequestWithRetry(
+      () => http.post(Uri.parse(endpoint)).timeout(const Duration(seconds: 20)),
+      endpoint
+    );
+    return jsonDecode(response.body) as Map<String, dynamic>;
+  }
+
+  Future<List<Map<String, dynamic>>> fetchNetworkInterfaces() async {
+    final endpoint = '$_baseUrl/api/v1/cameras/network/interfaces';
+    final response = await _sendRequestWithRetry(
+      () => http.get(Uri.parse(endpoint)).timeout(_normalTimeout),
+      endpoint
+    );
+    final data = jsonDecode(response.body);
+    return List<Map<String, dynamic>>.from(data['interfaces'] ?? []);
+  }
 }

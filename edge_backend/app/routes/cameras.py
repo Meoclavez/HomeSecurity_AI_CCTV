@@ -92,3 +92,43 @@ async def register_device_token(device_reg: DeviceTokenRegistration):
     """Register mobile device token (FCM / APNs) with SQLite persistence for emergency push alerts."""
     await notification_service.register_device(device_reg)
     return {"status": "success", "message": f"Persisted {device_reg.platform} device token."}
+
+
+@router.get("/network/interfaces")
+async def list_network_interfaces():
+    """List host network interfaces, carrier states, and IP assignments."""
+    from app.services.camera_network_manager import camera_network_manager
+    return {"interfaces": camera_network_manager.list_network_interfaces()}
+
+
+@router.get("/{camera_id}/diagnostics")
+async def diagnose_camera_stream(camera_id: str, db: AsyncSession = Depends(get_db)):
+    """Run deep 5-point diagnosis on a camera feed (Carrier, Ping, RTSP Port, Auth, Decoding)."""
+    stmt = select(CameraModel).where(CameraModel.id == camera_id)
+    res = await db.execute(stmt)
+    cam = res.scalar_one_or_none()
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    from app.services.camera_network_manager import camera_network_manager
+    report = await camera_network_manager.diagnose_camera(camera_id, cam.rtsp_url)
+    return report
+
+
+@router.post("/{camera_id}/auto-recover")
+async def trigger_camera_auto_recover(camera_id: str, db: AsyncSession = Depends(get_db)):
+    """Trigger dynamic IP migration discovery and auto-reconfigure for a missing camera."""
+    stmt = select(CameraModel).where(CameraModel.id == camera_id)
+    res = await db.execute(stmt)
+    cam = res.scalar_one_or_none()
+    if not cam:
+        raise HTTPException(status_code=404, detail="Camera not found")
+
+    from app.services.camera_network_manager import camera_network_manager
+    success = await camera_network_manager.attempt_auto_recover(camera_id, cam.rtsp_url)
+    return {
+        "status": "success" if success else "failed",
+        "message": f"Auto-recovery {'succeeded' if success else 'could not find camera on subnets'}",
+        "camera_id": camera_id
+    }
+
