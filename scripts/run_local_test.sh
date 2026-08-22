@@ -45,16 +45,34 @@ pip install --quiet \
     bcrypt \
     httpx
 
-# 3. Parse Custom Stream URL if provided
-STREAM_URL="${1:-}"
+# 3. Parse Custom Stream URL or GUI Flag
+IS_GUI=false
+STREAM_URL=""
 
-if [ -n "$STREAM_URL" ]; then
-  echo "[+] Testing with custom stream: $STREAM_URL"
-  python3 "$PROJECT_ROOT/scripts/test_local_system.py" --stream "$STREAM_URL" --duration 10
+for arg in "$@"; do
+  if [ "$arg" == "--gui" ] || [ "$arg" == "-g" ]; then
+    IS_GUI=true
+  else
+    STREAM_URL="$arg"
+  fi
+done
+
+if [ "$IS_GUI" = true ]; then
+  echo "[+] Launching Real-Time Live AI Vision Monitor & Performance HUD..."
+  if [ -n "$STREAM_URL" ]; then
+    python3 "$PROJECT_ROOT/scripts/monitor_live_ai.py" --stream "$STREAM_URL"
+  else
+    python3 "$PROJECT_ROOT/scripts/monitor_live_ai.py"
+  fi
 else
-  echo "[+] No stream URL passed. Testing with USB webcam / Synthetic generator..."
-  echo "    (Tip: Pass your ESP32 IP stream as: ./scripts/run_local_test.sh http://192.168.1.150:81/stream)"
-  python3 "$PROJECT_ROOT/scripts/test_local_system.py" --duration 10
+  if [ -n "$STREAM_URL" ]; then
+    echo "[+] Testing pipeline with custom stream: $STREAM_URL"
+    python3 "$PROJECT_ROOT/scripts/test_local_system.py" --stream "$STREAM_URL" --duration 10
+  else
+    echo "[+] Testing pipeline with USB webcam / Synthetic generator..."
+    echo "    (Tip: Run './scripts/run_local_test.sh --gui' for real-time visual monitor)"
+    python3 "$PROJECT_ROOT/scripts/test_local_system.py" --duration 10
+  fi
 fi
 
 echo "======================================================="

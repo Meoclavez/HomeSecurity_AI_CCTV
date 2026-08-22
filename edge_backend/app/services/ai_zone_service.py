@@ -502,5 +502,37 @@ class AIZoneService:
         privacy = self.get_or_create_privacy_engine(camera_id)
         return privacy.apply_privacy_masks(frame)
 
+    def process_detections(
+        self,
+        camera_id: str,
+        detections: Any,
+        frame_w: int = 640,
+        frame_h: int = 360
+    ) -> List[SecurityEventCreate]:
+        self.get_or_create_privacy_engine(camera_id)
+        tracker = self.zone_trackers.get(camera_id)
+        if not tracker:
+            return []
+
+        converted = []
+        if isinstance(detections, list):
+            for d in detections:
+                if isinstance(d, tuple) and len(d) == 2:
+                    converted.append(d)
+                elif isinstance(d, dict):
+                    track_id = d.get("track_id", 0)
+                    bbox_coords = d.get("bbox", [0.0, 0.0, 1.0, 1.0])
+                    bbox = BoundingBox(
+                        x_min=float(bbox_coords[0]),
+                        y_min=float(bbox_coords[1]),
+                        x_max=float(bbox_coords[2]),
+                        y_max=float(bbox_coords[3]),
+                        confidence=float(d.get("confidence", 0.9)),
+                        label=d.get("class_name", "person")
+                    )
+                    converted.append((track_id, bbox))
+
+        return tracker.process_detections(converted)
+
 
 ai_zone_service = AIZoneService()

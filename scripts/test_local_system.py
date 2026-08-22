@@ -24,11 +24,11 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "edge_backend"))
 
 from app.config import settings
-from app.models.schemas import Point2D, TripwireDirection, ZoneConfig, ZoneType
+from app.models.schemas import Point2D, TripwireDirection, ZoneConfig, ZoneType, BoundingBox
 from app.services.ai_zone_service import ai_zone_service
 from app.services.clip_recorder import clip_recorder_service
 from app.services.dvr_recorder import dvr_recorder_service
-from app.services.hailo_inference_service import hailo_inferencer
+from app.services.hailo_inference_service import hailo_inference_service
 from app.services.camera_network_manager import camera_network_manager
 
 
@@ -193,12 +193,12 @@ async def run_pipeline_test(source_url: Optional[str] = None, duration_seconds: 
             events_triggered += len(detected_events)
 
         # D. Test Kinematic Fall Engine
-        fall_event = hailo_inferencer.kinematics_engine.update_track(
+        bbox_obj = BoundingBox(x_min=0.35, y_min=0.45, x_max=0.45, y_max=0.75, confidence=0.96, label="person")
+        fall_event = hailo_inference_service.kinematic_engine.analyze_pose(
             camera_id=camera_id,
             track_id=101,
-            bbox=[0.35, 0.45, 0.45, 0.75],
-            keypoints=None,
-            timestamp=time.time()
+            keypoints=[],
+            bbox=bbox_obj
         )
         if fall_event:
             events_triggered += 1
@@ -230,14 +230,14 @@ async def run_pipeline_test(source_url: Optional[str] = None, duration_seconds: 
     clip_output_path = settings.CLIPS_DIR / f"test_event_{int(time.time())}.mp4"
     print(f"[+] Exporting verified 5s pre-roll clip from ring buffer to: {clip_output_path}")
 
-    pre_frames = ring_buffer.get_pre_event_frames(5.0)
+    pre_frames = ring_buffer.get_pre_event_frames()
     if pre_frames:
-        success = await clip_recorder_service._mux_frames_to_mp4(pre_frames, clip_output_path, fps=25)
-        if success and clip_output_path.exists():
+        await asyncio.to_thread(clip_recorder_service._mux_frames_to_mp4, pre_frames, clip_output_path, 25)
+        if clip_output_path.exists():
             file_size_kb = clip_output_path.stat().st_size / 1024
             print(f"✅ Pre-Roll MP4 Clip Successfully Created! Size: {file_size_kb:.1f} KB")
         else:
-            print("[-] MP4 muxing finished (FFmpeg verify)")
+            print("[-] MP4 muxing finished")
     else:
         print("[-] No frames in buffer to export")
 
@@ -249,7 +249,7 @@ async def run_pipeline_test(source_url: Optional[str] = None, duration_seconds: 
     print(f"[+] Recording sample 1-minute DVR segment: {dvr_segment_path.name}")
 
     if pre_frames:
-        await clip_recorder_service._mux_frames_to_mp4(pre_frames[:75], dvr_segment_path, fps=25)
+        await asyncio.to_thread(clip_recorder_service._mux_frames_to_mp4, pre_frames[:75], dvr_segment_path, 25)
         if dvr_segment_path.exists():
             print(f"✅ DVR Segment Verified on Disk: {dvr_segment_path} ({dvr_segment_path.stat().st_size / 1024:.1f} KB)")
 
@@ -277,7 +277,7 @@ async def run_pipeline_test(source_url: Optional[str] = None, duration_seconds: 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Edge AI CCTV Local Test Runner")
-    parser.add_argument("--stream", typestr := str, default=None,
+    parser.add_argument("--stream", type=str, default=None,
                         help="RTSP / HTTP MJPEG URL of ESP32 Camera (e.g. http://192.168.1.150:81/stream)")
     parser.add_argument("--duration", type=int, default=10,
                         help="Test duration in seconds (default: 10)")

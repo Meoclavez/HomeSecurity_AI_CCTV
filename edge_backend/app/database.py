@@ -23,9 +23,7 @@ engine = create_async_engine(
         "check_same_thread": False,
         "timeout": 15.0  # Busy timeout
     },
-    poolclass=QueuePool,
-    pool_size=5,
-    max_overflow=10,
+    pool_pre_ping=True,
     pool_recycle=3600,
 )
 
