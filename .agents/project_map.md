@@ -66,6 +66,7 @@ Edge_AI_CCTV/
 │   │   │   ├── dvr.py                        # 24-Hour Timeline, dynamic HLS playlists, incident exports, storage health
 │   │   │   └── zones.py                      # Camera privacy masks, tripwires, intrusion zones & alert muting
 │   │   └── services/
+│   │       ├── camera_network_manager.py     # Plug-and-Play NIC DHCP, 5-point camera diagnostics & IP migration watchdog
 │   │       ├── hailo_inference_service.py    # HailoRT PCIe (.hef) runner & kinematic fall engine
 │   │       ├── ai_zone_service.py            # Privacy masking, tripwires, polygon PIP, state machines & scheduler
 │   │       ├── dvr_recorder.py               # 24/7 continuous zero-copy segmenter, HLS, stitcher & SMART health
