@@ -1039,14 +1039,22 @@ class LiveAIMonitor:
 
             now = time.time()
             for ev in events:
-                if ev.event_type == ZoneType.TRIPWIRE or "TRIPWIRE" in ev.event_type.name:
-                    if self.debouncer.should_dispatch("tripwire", int(ev.camera_id if ev.camera_id.isdigit() else 1), now):
-                        self.in_count += 1
-                        self.trigger_alert(f"TRIPWIRE CROSSED by Person #{ev.camera_id}!", "TRIPWIRE")
-                elif ev.event_type == ZoneType.INTRUSION or "INTRUSION" in ev.event_type.name:
+                meta = getattr(ev, "metadata", {}) or {}
+                analytics_type = meta.get("analytics_type", "")
+                track_id_val = meta.get("track_id", 1)
+                direction_val = meta.get("direction", "A_TO_B")
+
+                if "TRIPWIRE" in analytics_type or ev.event_type.name == "PERIMETER_BREACH":
+                    if self.debouncer.should_dispatch("tripwire", int(track_id_val), now):
+                        if direction_val == "A_TO_B":
+                            self.in_count += 1
+                        else:
+                            self.out_count += 1
+                        self.trigger_alert(f"TRIPWIRE CROSSED [{direction_val}] by Person #{track_id_val}!", "TRIPWIRE")
+                elif "INTRUSION" in analytics_type or "INTRUSION" in ev.event_type.name:
                     self.is_intrusion_active = True
-                    if self.debouncer.should_dispatch("intrusion", int(ev.camera_id if ev.camera_id.isdigit() else 1), now):
-                        self.trigger_alert("RESTRICTED INTRUSION ZONE BREACHED!", "INTRUSION")
+                    if self.debouncer.should_dispatch("intrusion", int(track_id_val), now):
+                        self.trigger_alert(f"RESTRICTED INTRUSION ZONE BREACHED by Person #{track_id_val}!", "INTRUSION")
 
             ai_latency = (time.time() - ai_start) * 1000.0
             self.recent_latencies.append(ai_latency)

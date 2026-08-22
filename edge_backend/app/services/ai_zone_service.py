@@ -170,6 +170,7 @@ class TrackSpatialState:
     track_id: int
     label: str
     last_position: Tuple[float, float]
+    last_bbox: Optional[BoundingBox] = None
     entry_timestamps: Dict[str, float] = field(default_factory=dict)
     last_tripwire_alerts: Dict[str, float] = field(default_factory=dict)
     last_seen: float = field(default_factory=time.time)
@@ -214,17 +215,21 @@ class ZoneAnalyticsTracker:
                         track_id=track_id,
                         label=bbox.label,
                         last_position=curr_pos,
+                        last_bbox=bbox,
                         last_seen=now
                     )
+                    prev_bbox = bbox
                     prev_pos = curr_pos
                 else:
+                    prev_bbox = self.tracks[track_id].last_bbox or bbox
                     prev_pos = self.tracks[track_id].last_position
                     self.tracks[track_id].last_position = curr_pos
+                    self.tracks[track_id].last_bbox = bbox
                     self.tracks[track_id].last_seen = now
 
                 track_state = self.tracks[track_id]
 
-                # 1. Evaluate Tripwires
+                # 1. Evaluate Tripwires with Multi-Point Spine Trajectory
                 for zone_id, zone in self.zones.items():
                     if zone.zone_type != ZoneType.TRIPWIRE or not zone.line_start or not zone.line_end:
                         continue
@@ -236,7 +241,23 @@ class ZoneAnalyticsTracker:
                     try:
                         w_start = (zone.line_start.x, zone.line_start.y)
                         w_end = (zone.line_end.x, zone.line_end.y)
-                        crossing = PolygonGeometry.check_line_crossing(prev_pos, curr_pos, w_start, w_end)
+                        
+                        # Test multi-point spine trajectory (head, chest, torso, waist, feet)
+                        crossing = None
+                        spine_fractions = [0.15, 0.35, 0.50, 0.70, 0.85, 1.0]
+                        for frac in spine_fractions:
+                            p_prev = (
+                                (prev_bbox.x_min + prev_bbox.x_max) / 2.0,
+                                prev_bbox.y_min + frac * (prev_bbox.y_max - prev_bbox.y_min)
+                            )
+                            p_curr = (
+                                (bbox.x_min + bbox.x_max) / 2.0,
+                                bbox.y_min + frac * (bbox.y_max - bbox.y_min)
+                            )
+                            c = PolygonGeometry.check_line_crossing(p_prev, p_curr, w_start, w_end)
+                            if c:
+                                crossing = c
+                                break
 
                         if crossing:
                             is_valid_dir = (
@@ -244,12 +265,12 @@ class ZoneAnalyticsTracker:
                                 zone.direction == crossing
                             )
                             last_alert = track_state.last_tripwire_alerts.get(zone_id, 0.0)
-                            if is_valid_dir and (now - last_alert > 3.0):
+                            if is_valid_dir and (now - last_alert > 2.0):
                                 track_state.last_tripwire_alerts[zone_id] = now
                                 events.append(
                                     SecurityEventCreate(
                                         camera_id=self.camera_id,
-                                        event_type=EventType.INTRUSION_DETECTED,
+                                        event_type=EventType.PERIMETER_BREACH,
                                         severity=EventSeverity.CRITICAL,
                                         confidence=bbox.confidence,
                                         bounding_box=bbox,
