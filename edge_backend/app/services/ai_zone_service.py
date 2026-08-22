@@ -229,6 +229,10 @@ class ZoneAnalyticsTracker:
                     if zone.zone_type != ZoneType.TRIPWIRE or not zone.line_start or not zone.line_end:
                         continue
 
+                    # Filter by allowed classes (e.g. only "person" triggers human tripwires)
+                    if zone.allowed_classes and bbox.label not in zone.allowed_classes:
+                        continue
+
                     try:
                         w_start = (zone.line_start.x, zone.line_start.y)
                         w_end = (zone.line_end.x, zone.line_end.y)
@@ -265,6 +269,10 @@ class ZoneAnalyticsTracker:
                 # 2. Evaluate Polygon Intrusion & Loitering Zones
                 for zone_id, zone in self.zones.items():
                     if zone.zone_type != ZoneType.INTRUSION or not zone.polygon_points:
+                        continue
+
+                    # Filter by allowed classes
+                    if zone.allowed_classes and bbox.label not in zone.allowed_classes:
                         continue
                     
                     try:

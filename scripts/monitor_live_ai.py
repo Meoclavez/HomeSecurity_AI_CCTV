@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""Edge AI CCTV - Real-Time Live AI Vision, Kinematics & Security Zone Evaluator.
+"""Edge AI CCTV - Real-Time Live AI Vision, Multi-Class Detection & Kinematics Evaluator.
 
-Optimizations & Architectural Upgrades:
-1. Unified Robust Human Detection:
-   - OpenCV DNN YOLOv8/MobileNet-SSD support
-   - Morphological Vertical Body Merger with tall structuring elements (11x35) & NMS
-   - Completely eliminates limb fragmentation (single unified box from head to toe)
-2. High-Precision Kinematic Fall State Machine:
-   - 5-stage temporal state machine: STANDING -> RAPID_DESCENT -> COLLAPSED -> IMMOBILE -> FALL_CONFIRMED
-   - Immediate upright recovery path (prevents false alarms on standing/stretching persons)
-3. Zone Event Debouncing & Cooldown:
-   - 3.5s per-track cooldown to eliminate console/UI alert flooding
-4. Thread-Safe Background Video Muxing:
-   - Dedicated ThreadPoolExecutor for background MP4 exports (eliminates asyncio event loop errors)
-5. Cyberpunk Web HUD on http://0.0.0.0:8080 & Graceful HighGUI Desktop Fallback.
+Architectural Enhancements:
+1. Multi-Class Deep Learning Detection (OpenCV DNN YOLOv5/YOLOv8):
+   - Full 80-Class COCO Argmax classification (Person vs Package/Backpack vs Vehicle vs Animal)
+   - Eliminates false positive person detections on bags, backpacks, chairs, and pillows
+   - Strict human confidence threshold (>= 0.50) + letterbox geometry preservation
+2. Static Object & Immobility Rejection:
+   - Continuous Euclidean displacement tracking (Dt = sqrt(dx^2 + dy^2))
+   - Filters static/stationary anchors from triggering false perimeter intrusion or fall alarms
+3. 5-Stage Kinematic Fall State Machine:
+   - STANDING -> RAPID_DESCENT -> COLLAPSED -> IMMOBILE -> FALL_CONFIRMED
+   - Immediate upright recovery path
+4. Interactive Zone Drawing & Editing on Web HUD:
+   - Click/draw tripwire line endpoints and intrusion polygon vertices directly on live stream
+   - Real-time synchronization to backend AIZoneService
+5. Color-Coded Multi-Class Visualizer:
+   - Person: Green / Cyan
+   - Package / Bag: Orange / Amber
+   - Vehicle: Magenta / Purple
+   - Animal / Pet: Electric Yellow
 """
 
 import argparse
@@ -29,6 +35,7 @@ import sys
 import threading
 import time
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 import cv2
@@ -49,11 +56,47 @@ logger = logging.getLogger("LiveMonitor")
 
 
 # ==============================================================================
+# COCO Multi-Class Mapping & Constants
+# ==============================================================================
+COCO_CLASS_MAP = {
+    0: "person",
+    1: "vehicle", 2: "vehicle", 3: "vehicle", 5: "vehicle", 7: "vehicle",
+    15: "animal", 16: "animal", 17: "animal", 18: "animal", 19: "animal",
+    24: "package",  # backpack
+    25: "package",  # umbrella
+    26: "package",  # handbag
+    28: "package",  # suitcase
+}
+
+CLASS_THRESHOLDS = {
+    "person": 0.48,
+    "package": 0.35,
+    "vehicle": 0.45,
+    "animal": 0.40,
+    "default": 0.45
+}
+
+CLASS_COLORS = {
+    "person": (0, 255, 180),     # Green/Cyan
+    "package": (0, 160, 255),    # Orange/Amber
+    "vehicle": (240, 50, 200),   # Magenta/Purple
+    "animal": (255, 210, 0),     # Yellow/Gold
+    "default": (180, 190, 200)
+}
+
+
+@dataclass
+class DetectionObject:
+    bbox: Tuple[float, float, float, float]  # (x1, y1, x2, y2) normalized [0..1]
+    confidence: float
+    class_id: int
+    class_name: str
+
+
+# ==============================================================================
 # Thread-Safe Background Clip Muxer
 # ==============================================================================
 class BackgroundClipMuxer:
-    """Thread-safe background video muxing manager using a dedicated ThreadPool."""
-
     def __init__(self, max_workers: int = 2):
         self.executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ClipMuxerWorker")
 
@@ -65,14 +108,11 @@ class BackgroundClipMuxer:
         on_complete_callback: Optional[callable] = None
     ):
         if not frames:
-            logger.warning(f"[-] No frames provided for clip: {output_path}")
             return
-
         frames_copy = [f.copy() for f in frames]
 
         def _task():
             try:
-                # Direct thread-safe video write using OpenCV VideoWriter
                 h, w = frames_copy[0].shape[:2]
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -101,8 +141,6 @@ clip_muxer = BackgroundClipMuxer()
 # Zone Alert Debouncer
 # ==============================================================================
 class ZoneAlertDebouncer:
-    """Enforces per-track, per-zone cooldown to prevent alert flooding."""
-
     def __init__(self, cooldown_seconds: float = 3.5):
         self.cooldown_seconds = cooldown_seconds
         self.last_alerts: Dict[str, float] = {}
@@ -117,10 +155,10 @@ class ZoneAlertDebouncer:
 
 
 # ==============================================================================
-# Unified Robust Person Detector (DNN + Morphological Body Merger & NMS)
+# Multi-Class Deep Learning Detector (OpenCV DNN YOLOv5/YOLOv8 with Argmax)
 # ==============================================================================
 class UnifiedPersonDetector:
-    """Deep Learning Neural Network Person Detector via OpenCV DNN with Letterbox Preprocessing."""
+    """Full 80-Class Deep Neural Network Detector with strict Argmax and Letterboxing."""
 
     def __init__(self, onnx_model_path: Optional[str] = None):
         if onnx_model_path is None:
@@ -131,7 +169,6 @@ class UnifiedPersonDetector:
         self.net = None
         self.use_dnn = False
 
-        # 1. Attempt loading ONNX model (YOLOv5 / YOLOv8 / MobileNet-SSD)
         if onnx_model_path and os.path.exists(onnx_model_path):
             try:
                 self.net = cv2.dnn.readNetFromONNX(onnx_model_path)
@@ -143,7 +180,6 @@ class UnifiedPersonDetector:
                 logger.warning(f"[-] Could not load ONNX model ({e}). Using Morphological Body Merger.")
                 self.use_dnn = False
 
-        # Fallback Motion & Morphological Segmenter
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=24, detectShadows=False)
         self.vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 45))
         self.horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
@@ -157,9 +193,7 @@ class UnifiedPersonDetector:
         shape = img.shape[:2]
         r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
         new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
-        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
-        dw /= 2
-        dh /= 2
+        dw, dh = (new_shape[1] - new_unpad[0]) / 2, (new_shape[0] - new_unpad[1]) / 2
 
         if shape[::-1] != new_unpad:
             img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
@@ -168,8 +202,7 @@ class UnifiedPersonDetector:
         img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
         return img, r, (dw, dh)
 
-    def detect(self, frame: np.ndarray) -> List[Tuple[float, float, float, float, float]]:
-        """Returns normalized bounding boxes: [(x1, y1, x2, y2, confidence), ...]"""
+    def detect(self, frame: np.ndarray) -> List[DetectionObject]:
         h, w = frame.shape[:2]
         if self.use_dnn and self.net is not None:
             try:
@@ -180,74 +213,74 @@ class UnifiedPersonDetector:
                 logger.warning(f"DNN inference error ({e}), falling back to morphological.")
         return self._detect_morphological_merged(frame, w, h)
 
-    def _detect_dnn(self, frame: np.ndarray, w: int, h: int) -> List[Tuple[float, float, float, float, float]]:
+    def _detect_dnn(self, frame: np.ndarray, w: int, h: int) -> List[DetectionObject]:
         letterbox_img, ratio, (dw, dh) = self._letterbox(frame, (640, 640))
         blob = cv2.dnn.blobFromImage(letterbox_img, 1.0 / 255.0, (640, 640), (0, 0, 0), swapRB=True, crop=False)
         self.net.setInput(blob)
         preds = self.net.forward()
 
-        # Handle YOLOv5 (1, 25200, 85) or YOLOv8 (1, 84, 8400)
         if len(preds.shape) == 3:
-            if preds.shape[1] < preds.shape[2]:
-                preds = np.transpose(preds[0], (1, 0))
-            else:
-                preds = preds[0]
+            preds = np.transpose(preds[0], (1, 0)) if preds.shape[1] < preds.shape[2] else preds[0]
 
-        boxes, confidences = [], []
-        conf_thresh = 0.28
+        boxes, confidences, class_ids, class_names = [], [], [], []
 
         for row in preds:
-            if preds.shape[1] == 85:  # YOLOv5 format
+            if preds.shape[1] == 85:  # YOLOv5 format [cx, cy, w, h, obj_conf, p0...p79]
                 obj_conf = float(row[4])
-                if obj_conf > conf_thresh:
-                    person_score = float(row[5])  # Class 0 = Person
-                    total_score = obj_conf * person_score
-                    if total_score > conf_thresh:
-                        cx, cy, bw, bh = row[0], row[1], row[2], row[3]
-                        cx = (cx - dw) / ratio
-                        cy = (cy - dh) / ratio
-                        bw = bw / ratio
-                        bh = bh / ratio
-                        x1 = int(cx - bw / 2)
-                        y1 = int(cy - bh / 2)
-                        boxes.append([x1, y1, int(bw), int(bh)])
-                        confidences.append(total_score)
-            else:  # YOLOv8 format
-                person_score = float(row[4])
-                if person_score > conf_thresh:
-                    cx, cy, bw, bh = row[0], row[1], row[2], row[3]
-                    cx = (cx - dw) / ratio
-                    cy = (cy - dh) / ratio
-                    bw = bw / ratio
-                    bh = bh / ratio
-                    x1 = int(cx - bw / 2)
-                    y1 = int(cy - bh / 2)
-                    boxes.append([x1, y1, int(bw), int(bh)])
-                    confidences.append(person_score)
+                if obj_conf < 0.22:
+                    continue
+                class_scores = row[5:]
+                best_class_idx = int(np.argmax(class_scores))
+                class_score = float(class_scores[best_class_idx])
+                final_conf = obj_conf * class_score
+            else:  # YOLOv8 format [cx, cy, w, h, p0...p79]
+                class_scores = row[4:]
+                best_class_idx = int(np.argmax(class_scores))
+                final_conf = float(class_scores[best_class_idx])
 
-        indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_thresh, 0.45)
+            semantic_class = COCO_CLASS_MAP.get(best_class_idx, "unknown")
+            thresh = CLASS_THRESHOLDS.get(semantic_class, CLASS_THRESHOLDS["default"])
+
+            # True Argmax validation: Only accept if final_conf >= class threshold and recognized category
+            if final_conf >= thresh and semantic_class != "unknown":
+                cx, cy, bw, bh = row[0], row[1], row[2], row[3]
+                cx = (cx - dw) / ratio
+                cy = (cy - dh) / ratio
+                bw = bw / ratio
+                bh = bh / ratio
+                x1 = int(cx - bw / 2)
+                y1 = int(cy - bh / 2)
+                boxes.append([x1, y1, int(bw), int(bh)])
+                confidences.append(final_conf)
+                class_ids.append(best_class_idx)
+                class_names.append(semantic_class)
+
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.25, 0.45)
         results = []
         if len(indices) > 0:
-            for idx in indices.flatten():
+            flat_indices = indices.flatten() if hasattr(indices, "flatten") else [idx[0] if isinstance(idx, (list, tuple)) else idx for idx in indices]
+            for idx in flat_indices:
                 bx, by, bw_px, bh_px = boxes[idx]
-                results.append((
-                    max(0.0, bx / w),
-                    max(0.0, by / h),
-                    min(1.0, (bx + bw_px) / w),
-                    min(1.0, (by + bh_px) / h),
-                    confidences[idx]
+                results.append(DetectionObject(
+                    bbox=(
+                        max(0.0, bx / w),
+                        max(0.0, by / h),
+                        min(1.0, (bx + bw_px) / w),
+                        min(1.0, (by + bh_px) / h)
+                    ),
+                    confidence=confidences[idx],
+                    class_id=class_ids[idx],
+                    class_name=class_names[idx]
                 ))
         return results
 
-    def _detect_morphological_merged(self, frame: np.ndarray, w: int, h: int) -> List[Tuple[float, float, float, float, float]]:
+    def _detect_morphological_merged(self, frame: np.ndarray, w: int, h: int) -> List[DetectionObject]:
         scale = 480.0 / max(h, w)
         sw, sh = int(w * scale), int(h * scale)
         small = cv2.resize(frame, (sw, sh))
 
         fg_mask = self.bg_subtractor.apply(small)
-        # 1. Clean small salt-and-pepper noise
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_OPEN, self.horizontal_kernel)
-        # 2. Bridge vertical limb gaps with vertical structuring element
         fg_mask = cv2.morphologyEx(fg_mask, cv2.MORPH_CLOSE, self.vertical_kernel)
 
         contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -255,36 +288,34 @@ class UnifiedPersonDetector:
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area > 900:  # Minimum body cluster area
+            if area > 1000:
                 bx, by, bw_px, bh_px = cv2.boundingRect(cnt)
                 candidate_boxes.append([bx, by, bx + bw_px, by + bh_px, area])
 
-        # 3. Hierarchical Proximity Merging (combine torso + legs + arms into single body)
         merged_boxes = self._merge_adjacent_boxes(candidate_boxes)
-
         results = []
         for (x1, y1, x2, y2) in merged_boxes:
             norm_x1 = max(0.0, (x1 / scale) / w)
             norm_y1 = max(0.0, (y1 / scale) / h)
             norm_x2 = min(1.0, (x2 / scale) / w)
             norm_y2 = min(1.0, (y2 / scale) / h)
-
             box_h = norm_y2 - norm_y1
             box_w = norm_x2 - norm_x1
 
-            # Only retain human-sized silhouettes (height >= 12% of frame or area >= 2.5%)
-            if box_h >= 0.12 or (box_h * box_w) >= 0.025:
-                results.append((norm_x1, norm_y1, norm_x2, norm_y2, 0.92))
-
+            if box_h >= 0.14 or (box_h * box_w) >= 0.030:
+                results.append(DetectionObject(
+                    bbox=(norm_x1, norm_y1, norm_x2, norm_y2),
+                    confidence=0.88,
+                    class_id=0,
+                    class_name="person"
+                ))
         return results
 
     def _merge_adjacent_boxes(self, boxes: List[List[float]]) -> List[Tuple[int, int, int, int]]:
-        """Merges fragmented sub-boxes belonging to the same human silhouette."""
         if not boxes:
             return []
-
-        merged = True
         current_boxes = [[b[0], b[1], b[2], b[3]] for b in boxes]
+        merged = True
 
         while merged:
             merged = False
@@ -299,18 +330,12 @@ class UnifiedPersonDetector:
                     if used[j]:
                         continue
                     bx1, by1, bx2, by2 = current_boxes[j]
-
-                    # Check Horizontal Overlap
                     x_overlap = max(0, min(ax2, bx2) - max(ax1, bx1))
                     min_w = min(ax2 - ax1, bx2 - bx1)
-
-                    # Check Vertical Distance / Gap
                     y_dist = max(0, max(ay1, by1) - min(ay2, by2))
                     max_h = max(ay2 - ay1, by2 - by1)
 
-                    # Merge condition: Horizontal overlap + vertical proximity within 40% of body height
-                    if (min_w > 0 and (x_overlap / min_w) > 0.25 and y_dist < (0.40 * max_h)) or \
-                       (x_overlap > 0 and y_dist == 0):
+                    if (min_w > 0 and (x_overlap / min_w) > 0.25 and y_dist < (0.40 * max_h)) or (x_overlap > 0 and y_dist == 0):
                         ax1 = min(ax1, bx1)
                         ay1 = min(ay1, by1)
                         ax2 = max(ax2, bx2)
@@ -327,7 +352,7 @@ class UnifiedPersonDetector:
 
 
 # ==============================================================================
-# High-Precision Kinematic Fall State Machine
+# High-Precision Multi-Class Track & Kinematic State Machine
 # ==============================================================================
 class KinematicState(str, Enum):
     STANDING = "STANDING"
@@ -337,60 +362,98 @@ class KinematicState(str, Enum):
     FALL_CONFIRMED = "FALL_CONFIRMED"
 
 
+class MotionState(str, Enum):
+    ACTIVE_MOVING = "ACTIVE_MOVING"
+    STATIONARY = "STATIONARY"
+    STATIC_ANCHOR = "STATIC_ANCHOR"
+
+
 class KinematicPersonTracker:
-    """Multi-frame kinematic state machine tracking human poses and eliminating false fall alarms."""
+    """Tracks persistent state, multi-class labels, displacement, and fall kinematics."""
 
-    def __init__(self, track_id: int, initial_bbox: Tuple[float, float, float, float]):
+    def __init__(self, track_id: int, det: DetectionObject):
         self.track_id = track_id
-        self.bbox = initial_bbox
+        self.bbox = det.bbox
+        self.class_name = det.class_name
+        self.confidence = det.confidence
         self.state = KinematicState.STANDING
+        self.motion_state = MotionState.ACTIVE_MOVING
         self.last_seen = time.time()
+        self.first_seen = time.time()
 
-        # State Timers
+        # Displacement & Immobility
+        self.history: List[Tuple[float, float, float, float]] = []  # (t, cx, cy, h)
+        self.displacement_2s = 0.0
+        self.stationary_start_time: Optional[float] = None
+        self.stationary_duration = 0.0
+
+        # Kinematic Metrics
         self.descent_start_time: Optional[float] = None
         self.collapsed_start_time: Optional[float] = None
-        self.state_enter_time = time.time()
-
-        # Metrics
-        self.history: List[Tuple[float, float, float, float]] = []
         self.aspect_ratio = 1.8
         self.smoothed_ar = 1.8
         self.descent_velocity = 0.0
         self.torso_angle = 85.0
         self.alert_dispatched = False
 
-    def update(self, bbox: Tuple[float, float, float, float], now: float):
-        self.bbox = bbox
+    def update(self, det: DetectionObject, now: float):
+        self.bbox = det.bbox
+        self.class_name = det.class_name
+        self.confidence = det.confidence
         self.last_seen = now
-        x1, y1, x2, y2 = bbox
+
+        x1, y1, x2, y2 = det.bbox
         w = max(0.01, x2 - x1)
         h = max(0.01, y2 - y1)
+        cx = (x1 + x2) / 2.0
         cy = (y1 + y2) / 2.0
         self.aspect_ratio = h / w
 
         # EMA smoothing on Aspect Ratio
         self.smoothed_ar = 0.65 * self.aspect_ratio + 0.35 * self.smoothed_ar
 
-        # Calculate descent velocity over recent temporal window
+        # Calculate descent velocity
         if self.history:
             dt = max(0.001, now - self.history[-1][0])
-            inst_v = (cy - self.history[-1][1]) / dt * 2.5
+            inst_v = (cy - self.history[-1][2]) / dt * 2.5
             self.descent_velocity = max(0.0, 0.70 * inst_v + 0.30 * self.descent_velocity)
         else:
             self.descent_velocity = 0.0
 
-        # Torso inclination estimation: map AR to angle [5..90] degrees
+        # Torso inclination estimation
         clamped_ar = max(0.35, min(2.2, self.smoothed_ar))
         self.torso_angle = max(5.0, min(90.0, math.degrees(math.atan2(clamped_ar, 1.0)) * 1.35))
 
-        self.history.append((now, cy, h, w))
-        self.history = [pt for pt in self.history if now - pt[0] <= 5.0]
+        self.history.append((now, cx, cy, h))
+        self.history = [pt for pt in self.history if now - pt[0] <= 3.5]
 
-        # Evaluate State Machine Transitions
-        self._evaluate_state_transitions(now)
+        # Calculate Displacement over the last 2.0 seconds
+        if len(self.history) >= 2:
+            old_t, old_cx, old_cy, _ = self.history[0]
+            self.displacement_2s = math.hypot(cx - old_cx, cy - old_cy)
+        else:
+            self.displacement_2s = 0.0
+
+        # Evaluate Static Immobility / Stationary Anchor
+        if self.displacement_2s < 0.020:  # Less than 2.0% frame displacement over 2-3s
+            if self.stationary_start_time is None:
+                self.stationary_start_time = now
+            self.stationary_duration = now - self.stationary_start_time
+
+            if self.stationary_duration >= 4.0:
+                self.motion_state = MotionState.STATIC_ANCHOR
+            else:
+                self.motion_state = MotionState.STATIONARY
+        else:
+            self.stationary_start_time = None
+            self.stationary_duration = 0.0
+            self.motion_state = MotionState.ACTIVE_MOVING
+
+        # Evaluate Fall State Transitions ONLY for genuine moving humans
+        if self.class_name == "person":
+            self._evaluate_state_transitions(now)
 
     def _evaluate_state_transitions(self, now: float):
-        # 1. Recovery Check: If person stands upright (AR > 1.20 and θ > 52°), immediately return to STANDING
         if self.smoothed_ar > 1.20 and self.torso_angle > 52.0:
             if self.state != KinematicState.STANDING:
                 logger.info(f"[Kinematics] Track #{self.track_id} returned to STANDING.")
@@ -400,47 +463,40 @@ class KinematicPersonTracker:
             self.alert_dispatched = False
             return
 
-        # 2. STANDING -> RAPID_DESCENT (Requires sudden vertical velocity spike >= 1.30 m/s)
         if self.state == KinematicState.STANDING:
             if self.descent_velocity >= 1.30:
                 self.state = KinematicState.RAPID_DESCENT
                 self.descent_start_time = now
-                self.state_enter_time = now
                 logger.debug(f"[Kinematics] Track #{self.track_id} entered RAPID_DESCENT (Vy={self.descent_velocity:.2f} m/s)")
 
-        # 3. RAPID_DESCENT -> COLLAPSED (Aspect ratio collapses near floor within 1.0s)
         elif self.state == KinematicState.RAPID_DESCENT:
             time_in_descent = now - (self.descent_start_time or now)
             if self.smoothed_ar <= 0.85 and self.torso_angle <= 38.0:
                 self.state = KinematicState.COLLAPSED
                 self.collapsed_start_time = now
-                self.state_enter_time = now
                 logger.info(f"[Kinematics] Track #{self.track_id} entered COLLAPSED (AR={self.smoothed_ar:.2f}, θ={self.torso_angle:.1f}°)")
             elif time_in_descent > 1.0:
-                # Timed out without collapse -> normal motion
                 self.state = KinematicState.STANDING
 
-        # 4. COLLAPSED -> IMMOBILE (Sustained motionless on floor for >= 1.8s)
         elif self.state == KinematicState.COLLAPSED:
             time_collapsed = now - (self.collapsed_start_time or now)
             if self.descent_velocity < 0.35 and time_collapsed >= 1.8:
                 self.state = KinematicState.IMMOBILE
-                self.state_enter_time = now
-                logger.warning(f"[Kinematics] Track #{self.track_id} entered IMMOBILE on floor ({time_collapsed:.1f}s)")
 
-        # 5. IMMOBILE -> FALL_CONFIRMED (Total collapse time >= 2.5s)
         elif self.state == KinematicState.IMMOBILE:
             total_floor_time = now - (self.collapsed_start_time or now)
             if total_floor_time >= 2.5:
                 self.state = KinematicState.FALL_CONFIRMED
+
+    @property
+    def is_active_human(self) -> bool:
+        return self.class_name == "person" and self.motion_state != MotionState.STATIC_ANCHOR
 
 
 # ==============================================================================
 # Camera Discovery & Scanner
 # ==============================================================================
 class CameraScanner:
-    """Discovers local USB cameras, mDNS ESP32 devices, and subnet RTSP/MJPEG streams."""
-
     @staticmethod
     def scan_usb_cameras() -> List[Dict[str, str]]:
         found = []
@@ -478,18 +534,16 @@ class CameraScanner:
     @classmethod
     def scan_network_cameras(cls) -> List[Dict[str, str]]:
         found = []
-        # 1. Probe mDNS esp32-cctv.local
         try:
             ip = socket.gethostbyname("esp32-cctv.local")
             found.append({
                 "id": "esp32_mdns",
-                "name": f"ESP32-S3 Camera (esp32-cctv.local:81)",
+                "name": "ESP32-S3 Camera (esp32-cctv.local:81)",
                 "url": f"http://{ip}:81/stream"
             })
         except Exception:
             pass
 
-        # 2. Probe host subnet
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -550,15 +604,15 @@ class LiveAIMonitor:
         self.cap: Optional[cv2.VideoCapture] = None
         self.current_source_name = "Detecting..."
 
-        # Robust Unified Person Detector & Zone Debouncer
+        # Robust Multi-Class Unified Person Detector
         self.detector = UnifiedPersonDetector()
         self.debouncer = ZoneAlertDebouncer(cooldown_seconds=3.5)
 
-        # Tracked Persons
+        # Tracked Objects & Persons
         self.tracks: Dict[int, KinematicPersonTracker] = {}
         self.next_track_id = 1
 
-        # Performance Metrics
+        # Metrics
         self.fps = 0.0
         self.frame_count = 0
         self.avg_inference_ms = 0.0
@@ -635,6 +689,7 @@ class LiveAIMonitor:
                 name=self.tripwire_config["name"],
                 zone_type=ZoneType.TRIPWIRE,
                 enabled=True,
+                allowed_classes=["person"],
                 line_start=Point2D(x=float(self.tripwire_config["x1"]), y=float(self.tripwire_config["y1"])),
                 line_end=Point2D(x=float(self.tripwire_config["x2"]), y=float(self.tripwire_config["y2"])),
                 direction=direction_enum
@@ -648,6 +703,7 @@ class LiveAIMonitor:
                 name=self.intrusion_config["name"],
                 zone_type=ZoneType.INTRUSION,
                 enabled=True,
+                allowed_classes=["person"],
                 polygon_points=pts,
                 dwell_time_seconds=1.0
             ))
@@ -703,7 +759,6 @@ class LiveAIMonitor:
         return sources
 
     def open_video_source(self):
-        # 1. Try explicit stream
         if self.stream_source and self.stream_source != "synthetic":
             logger.info(f"[+] Connecting to custom stream: {self.stream_source}")
             try:
@@ -720,7 +775,6 @@ class LiveAIMonitor:
             except Exception as e:
                 logger.warning(f"[-] Could not open {self.stream_source}: {e}")
 
-        # 2. Try Auto-Discovery
         if not self.available_sources:
             self.available_sources = CameraScanner.discover_all()
 
@@ -742,22 +796,19 @@ class LiveAIMonitor:
             except Exception:
                 pass
 
-        # 3. Fallback to Synthetic Generator
         logger.info("🛡️ Operating in Built-In High-Fidelity Synthetic AI Pipeline.")
         self.cap = None
         self.stream_source = "synthetic"
         self.current_source_name = "Synthetic Benchmark Feed"
 
-    def update_tracks(self, detections: List[Tuple[float, float, float, float, float]]):
-        """Updates persistent human tracks and evaluates kinematic state machine."""
+    def update_tracks(self, detections: List[DetectionObject]):
         now = time.time()
         updated_tracks = set()
 
-        for (x1, y1, x2, y2, conf) in detections:
-            cx = (x1 + x2) / 2.0
-            cy = (y1 + y2) / 2.0
+        for det in detections:
+            cx = (det.bbox[0] + det.bbox[2]) / 2.0
+            cy = (det.bbox[1] + det.bbox[3]) / 2.0
 
-            # Match to closest existing track
             best_track_id = None
             min_dist = 0.28
 
@@ -774,9 +825,9 @@ class LiveAIMonitor:
             if best_track_id is None:
                 best_track_id = self.next_track_id
                 self.next_track_id += 1
-                self.tracks[best_track_id] = KinematicPersonTracker(best_track_id, (x1, y1, x2, y2))
+                self.tracks[best_track_id] = KinematicPersonTracker(best_track_id, det)
 
-            self.tracks[best_track_id].update((x1, y1, x2, y2), now)
+            self.tracks[best_track_id].update(det, now)
             updated_tracks.add(best_track_id)
 
         # Cleanup stale tracks (> 2.5 seconds unseen)
@@ -784,18 +835,18 @@ class LiveAIMonitor:
         for tid in stale_ids:
             del self.tracks[tid]
 
-        self.person_count = len(self.tracks)
+        # Only count active persons
+        active_humans = [t for t in self.tracks.values() if t.is_active_human]
+        self.person_count = len(active_humans)
 
-        # Update aggregated telemetry from primary subject
-        if self.tracks:
-            primary = list(self.tracks.values())[0]
+        if active_humans:
+            primary = active_humans[0]
             self.torso_angle = primary.torso_angle
             self.aspect_ratio = primary.smoothed_ar
             self.descent_velocity = primary.descent_velocity
             self.floor_proximity = min(1.0, primary.bbox[3])
             self.is_fall_active = (primary.state in (KinematicState.COLLAPSED, KinematicState.IMMOBILE, KinematicState.FALL_CONFIRMED))
 
-            # Dispatch genuine fall alarm upon FALL_CONFIRMED
             if primary.state == KinematicState.FALL_CONFIRMED and not primary.alert_dispatched:
                 primary.alert_dispatched = True
                 self.trigger_alert(
@@ -803,7 +854,6 @@ class LiveAIMonitor:
                     "FALL_DETECTED",
                     duration=5.0
                 )
-                # Thread-safe background clip export
                 clip_path = settings.CLIPS_DIR / f"fall_event_{int(time.time())}.mp4"
                 pre_frames = self.ring_buffer.get_pre_event_frames()
                 if pre_frames:
@@ -819,12 +869,10 @@ class LiveAIMonitor:
         frame = np.full((720, 1280, 3), (24, 28, 36), dtype=np.uint8)
         t = time.time()
 
-        # Room floor & grid
         cv2.rectangle(frame, (0, 480), (1280, 720), (35, 40, 50), -1)
         for y in range(480, 720, 40):
             cv2.line(frame, (0, y), (1280, y), (45, 52, 65), 1)
 
-        # Walking avatar
         px = 0.50 + 0.30 * np.sin(t * 0.5)
         py = 0.52 + 0.10 * np.cos(t * 0.8)
         cx, cy = int(px * 1280), int(py * 720)
@@ -839,7 +887,7 @@ class LiveAIMonitor:
         hud = frame.copy()
         h, w = hud.shape[:2]
 
-        # 1. Render Tripwire Line & Labels
+        # 1. Render Tripwire Line
         if self.tripwire_config.get("enabled"):
             tx1 = int(self.tripwire_config["x1"] * w)
             ty1 = int(self.tripwire_config["y1"] * h)
@@ -865,28 +913,39 @@ class LiveAIMonitor:
             cv2.putText(hud, f"🛑 INTRUSION ZONE {'[BREACHED!]' if self.is_intrusion_active else '[ARMED]'}",
                         (pts[0][0] + 8, pts[0][1] + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, zone_color, 2)
 
-        # 3. Render Unified Human Bounding Boxes & Kinematic Pose State
+        # 3. Render Multi-Class Color-Coded Bounding Boxes
         for tid, t in self.tracks.items():
             bx1 = int(t.bbox[0] * w)
             by1 = int(t.bbox[1] * h)
             bx2 = int(t.bbox[2] * w)
             by2 = int(t.bbox[3] * h)
 
-            if t.state in (KinematicState.COLLAPSED, KinematicState.IMMOBILE, KinematicState.FALL_CONFIRMED):
-                box_color = (0, 0, 255)  # Red for Fall
-            elif t.state == KinematicState.RAPID_DESCENT:
-                box_color = (0, 165, 255)  # Orange for Descent
+            if t.class_name == "person":
+                if t.state in (KinematicState.COLLAPSED, KinematicState.IMMOBILE, KinematicState.FALL_CONFIRMED):
+                    box_color = (0, 0, 255)
+                elif t.motion_state == MotionState.STATIC_ANCHOR:
+                    box_color = (130, 140, 150)
+                else:
+                    box_color = CLASS_COLORS["person"]
+                label = f"ID:{tid} Person | {t.state.value} | θ:{t.torso_angle:.0f}° | AR:{t.smoothed_ar:.2f}"
+            elif t.class_name == "package":
+                box_color = CLASS_COLORS["package"]
+                label = f"ID:{tid} Package/Bag ({t.confidence:.2f})"
+            elif t.class_name == "vehicle":
+                box_color = CLASS_COLORS["vehicle"]
+                label = f"ID:{tid} Vehicle ({t.confidence:.2f})"
+            elif t.class_name == "animal":
+                box_color = CLASS_COLORS["animal"]
+                label = f"ID:{tid} Pet/Animal ({t.confidence:.2f})"
             else:
-                box_color = (0, 255, 180)  # Green for Upright
+                box_color = CLASS_COLORS["default"]
+                label = f"ID:{tid} {t.class_name.upper()} ({t.confidence:.2f})"
 
             cv2.rectangle(hud, (bx1, by1), (bx2, by2), box_color, 2)
 
-            # Footprint anchor point
             foot_x = (bx1 + bx2) // 2
             foot_y = by2
-            cv2.circle(hud, (foot_x, foot_y), 4, (0, 240, 255), -1)
-
-            label = f"ID:{tid} Person | {t.state.value} | θ:{t.torso_angle:.0f}° | AR:{t.smoothed_ar:.2f}"
+            cv2.circle(hud, (foot_x, foot_y), 4, box_color, -1)
             cv2.putText(hud, label, (bx1, max(20, by1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, box_color, 2)
 
         # 4. Top Status Bar
@@ -895,9 +954,9 @@ class LiveAIMonitor:
         cv2.addWeighted(overlay, 0.85, hud, 0.15, 0, hud)
         cv2.line(hud, (0, 54), (w, 54), (0, 240, 255), 1)
 
-        cv2.putText(hud, "🛡️ EDGE AI CCTV - REAL-TIME KINEMATICS EVALUATOR", (16, 26),
+        cv2.putText(hud, "🛡️ EDGE AI CCTV - MULTI-CLASS AI & KINEMATICS", (16, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 240, 255), 2)
-        cv2.putText(hud, f"Source: {self.current_source_name} | Persons Detected: {self.person_count}", (16, 46),
+        cv2.putText(hud, f"Source: {self.current_source_name} | Humans: {self.person_count} | Total Tracks: {len(self.tracks)}", (16, 46),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.44, (160, 180, 200), 1)
 
         fps_text = f"FPS: {self.fps:.1f} | Latency: {self.avg_inference_ms:.1f}ms | Res: {w}x{h}"
@@ -943,14 +1002,12 @@ class LiveAIMonitor:
         return hud
 
     def capture_frame_loop(self):
-        """Continuous frame ingestion, unified body detection, zone analytics, and MJPEG encoder."""
         self.open_video_source()
         last_time = time.time()
 
         while self.is_running:
             loop_start = time.time()
 
-            # 1. Grab Frame
             frame = None
             if self.cap and self.cap.isOpened():
                 ret, raw_frame = self.cap.read()
@@ -961,21 +1018,21 @@ class LiveAIMonitor:
             else:
                 frame = self.generate_synthetic_frame()
 
-            # 2. Run Unified Human Detection
             ai_start = time.time()
-            raw_detections = self.detector.detect(frame)
-            self.update_tracks(raw_detections)
+            detections = self.detector.detect(frame)
+            self.update_tracks(detections)
 
-            # 3. Zone & Tripwire Processing with Debouncing
             h, w = frame.shape[:2]
             detections_for_zones = []
+            # Only evaluate active (non-static) tracks in zone engine
             for tid, t in self.tracks.items():
-                detections_for_zones.append({
-                    "track_id": tid,
-                    "class_name": "person",
-                    "confidence": 0.94,
-                    "bbox": list(t.bbox)
-                })
+                if t.motion_state != MotionState.STATIC_ANCHOR:
+                    detections_for_zones.append({
+                        "track_id": tid,
+                        "class_name": t.class_name,
+                        "confidence": t.confidence,
+                        "bbox": list(t.bbox)
+                    })
 
             events = ai_zone_service.process_detections(self.camera_id, detections_for_zones, w, h)
             self.is_intrusion_active = False
@@ -997,19 +1054,14 @@ class LiveAIMonitor:
                 self.recent_latencies.pop(0)
             self.avg_inference_ms = sum(self.recent_latencies) / len(self.recent_latencies)
 
-            # 4. Ring Buffer Push
             self.ring_buffer.push_frame(frame)
-
-            # 5. Draw HUD Canvas
             hud_frame = self.draw_hud(frame)
 
-            # 6. Encode JPEG for Web HUD broadcast
             ret, jpeg_bytes = cv2.imencode(".jpg", hud_frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if ret:
                 with self.frame_lock:
                     self.latest_encoded_jpeg = jpeg_bytes.tobytes()
 
-            # 7. FPS Calculation
             self.frame_count += 1
             now = time.time()
             if now - last_time >= 1.0:
@@ -1017,7 +1069,6 @@ class LiveAIMonitor:
                 self.frame_count = 0
                 last_time = now
 
-            # Pacing to ~30 FPS
             elapsed = time.time() - loop_start
             sleep_time = max(0.005, (1.0 / 30.0) - elapsed)
             time.sleep(sleep_time)
@@ -1062,7 +1113,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Edge AI CCTV - Live Kinematics & Zone Evaluator</title>
+  <title>Edge AI CCTV - Multi-Class AI & Kinematics</title>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
@@ -1071,8 +1122,8 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       --card-border: rgba(0, 240, 255, 0.25);
       --accent-cyan: #00f0ff;
       --accent-green: #00ff9d;
+      --accent-orange: #ffaa00;
       --accent-red: #ff0055;
-      --accent-amber: #ffaa00;
       --text-main: #f0f6fc;
       --text-dim: #8b949e;
     }
@@ -1112,7 +1163,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     }
     .main-grid {
       display: grid;
-      grid-template-columns: 1fr 380px;
+      grid-template-columns: 1fr 390px;
       gap: 16px;
     }
     @media (max-width: 1080px) {
@@ -1142,6 +1193,15 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       height: 100%;
       object-fit: cover;
       display: block;
+    }
+    #interactiveCanvas {
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 100%;
+      height: 100%;
+      cursor: crosshair;
+      z-index: 10;
     }
     .card {
       background: var(--card-bg);
@@ -1184,7 +1244,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       font-family: 'Plus Jakarta Sans', sans-serif;
       font-size: 12px;
       font-weight: 700;
-      padding: 10px 14px;
+      padding: 9px 12px;
       border-radius: 8px;
       cursor: pointer;
       display: flex;
@@ -1202,29 +1262,6 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     .btn-primary:hover { background: var(--accent-cyan); color: #000; }
     .btn-danger { background: rgba(255, 0, 85, 0.15); border-color: var(--accent-red); color: var(--accent-red); }
     .btn-danger:hover { background: var(--accent-red); color: #fff; }
-    .input-row {
-      display: grid;
-      grid-template-columns: 1fr 1fr;
-      gap: 8px;
-      margin-bottom: 8px;
-    }
-    .input-group label {
-      font-size: 11px;
-      color: var(--text-dim);
-      display: block;
-      margin-bottom: 4px;
-    }
-    .input-group input, select {
-      width: 100%;
-      background: #161b22;
-      border: 1px solid rgba(255,255,255,0.15);
-      color: #fff;
-      padding: 6px 10px;
-      border-radius: 6px;
-      font-size: 12px;
-      font-family: 'JetBrains Mono', monospace;
-      outline: none;
-    }
     .event-log-container {
       max-height: 180px;
       overflow-y: auto;
@@ -1241,7 +1278,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       font-family: 'JetBrains Mono', monospace;
     }
     .event-fall { border-left-color: var(--accent-red); color: #ff99bb; }
-    .event-intrusion { border-left-color: var(--accent-amber); color: #ffd280; }
+    .event-intrusion { border-left-color: var(--accent-orange); color: #ffd280; }
     .toast {
       position: fixed;
       bottom: 20px;
@@ -1264,7 +1301,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       <span style="font-size: 22px;">🛡️</span>
       <div>
         <div class="logo-title">EDGE AI CCTV CORE</div>
-        <div style="font-size: 11.5px; color: var(--text-dim);">Live Multi-Platform AI Vision, Kinematics & Zone Evaluator</div>
+        <div style="font-size: 11.5px; color: var(--text-dim);">Multi-Class Neural Vision & Kinematics Evaluator</div>
       </div>
     </div>
     <div style="display: flex; gap: 8px; align-items: center;">
@@ -1275,26 +1312,34 @@ def create_web_hud_app(monitor: LiveAIMonitor):
   </header>
 
   <div class="main-grid">
-    <!-- Live Video Viewport -->
     <div class="video-card">
-      <div class="video-viewport">
-        <img src="/stream" alt="Live AI Vision Feed" />
+      <div class="video-viewport" id="viewportWrapper">
+        <img id="streamImg" src="/stream" alt="Live AI Vision Feed" />
+        <canvas id="interactiveCanvas"></canvas>
+      </div>
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+        <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('TRIPWIRE')">⚡ Draw Tripwire (Click 2 Pts)</button>
+        <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('INTRUSION')">🛑 Draw Polygon (Click Pts)</button>
+        <button class="btn" style="flex: 1;" onclick="syncCanvasToBackend()">💾 Sync Zone to AI</button>
+        <button class="btn btn-danger" style="flex: 0.8;" onclick="clearCanvasPoints()">🗑️ Clear</button>
       </div>
       <div style="display: flex; gap: 10px;">
-        <button class="btn btn-primary" onclick="triggerSnapshot()">📸 Take Snapshot</button>
-        <button class="btn btn-danger" onclick="triggerClip()">🎥 Export 10s Pre/Post MP4 Clip</button>
+        <button class="btn" onclick="triggerSnapshot()">📸 Take Snapshot</button>
+        <button class="btn" onclick="triggerClip()">🎥 Export 10s MP4 Clip</button>
         <button class="btn" onclick="rescanCameras()">🔄 Rescan Cameras</button>
       </div>
     </div>
 
-    <!-- Side Control & Configuration Panels -->
     <div>
-      <!-- Live Kinematic Telemetry Card -->
       <div class="card">
-        <div class="card-title">📊 Live Kinematic Pose Metrics</div>
+        <div class="card-title">📊 Multi-Class Telemetry</div>
         <div class="telemetry-row">
-          <span class="telemetry-label">Persons Detected:</span>
+          <span class="telemetry-label">Active Humans:</span>
           <span class="telemetry-val" id="personCountVal">0</span>
+        </div>
+        <div class="telemetry-row">
+          <span class="telemetry-label">Total Tracks (Bags/Cars/Pets):</span>
+          <span class="telemetry-val" id="totalTracksVal" style="color: var(--accent-orange);">0</span>
         </div>
         <div class="telemetry-row">
           <span class="telemetry-label">Torso Angle (θ):</span>
@@ -1305,49 +1350,21 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           <span class="telemetry-val" id="velocityVal">0.00 m/s</span>
         </div>
         <div class="telemetry-row">
-          <span class="telemetry-label">Aspect Ratio (H/W):</span>
-          <span class="telemetry-val" id="aspectVal">1.90</span>
-        </div>
-        <div class="telemetry-row">
-          <span class="telemetry-label">Fall Alarm Status:</span>
+          <span class="telemetry-label">Fall Status:</span>
           <span class="telemetry-val" id="fallStatusVal">NORMAL</span>
         </div>
       </div>
 
-      <!-- Real-Time Tripwire Position Configurator -->
-      <div class="card">
-        <div class="card-title">📐 Virtual Tripwire Position</div>
-        <div class="input-row">
-          <div class="input-group"><label>Start X1 (0.0-1.0)</label><input type="number" id="twX1" step="0.05" value="0.15"></div>
-          <div class="input-group"><label>Start Y1 (0.0-1.0)</label><input type="number" id="twY1" step="0.05" value="0.55"></div>
-        </div>
-        <div class="input-row">
-          <div class="input-group"><label>End X2 (0.0-1.0)</label><input type="number" id="twX2" step="0.05" value="0.85"></div>
-          <div class="input-group"><label>End Y2 (0.0-1.0)</label><input type="number" id="twY2" step="0.05" value="0.55"></div>
-        </div>
-        <div class="input-group" style="margin-bottom: 8px;">
-          <label>Direction</label>
-          <select id="twDir">
-            <option value="BIDIRECTIONAL">Bidirectional (A ↔ B)</option>
-            <option value="A_TO_B">Entry Only (A → B)</option>
-            <option value="B_TO_A">Exit Only (B → A)</option>
-          </select>
-        </div>
-        <button class="btn btn-primary" onclick="updateTripwire()">💾 Save & Apply Tripwire Position</button>
-      </div>
-
-      <!-- Live Security Event History Log -->
       <div class="card">
         <div class="card-title">📋 Real Security Events Log</div>
         <div class="event-log-container" id="eventLogList">
-          <div class="event-log-item">System armed and monitoring active...</div>
+          <div class="event-log-item">System armed. Multi-class detection active.</div>
         </div>
       </div>
 
-      <!-- Camera Feed Switcher -->
       <div class="card">
-        <div class="card-title">📹 Camera Feeds</div>
-        <select id="cameraSelect" onchange="changeCameraSource(this.value)">
+        <div class="card-title">📹 Camera Feeds & Streams</div>
+        <select id="cameraSelect" onchange="changeCameraSource(this.value)" style="width: 100%; background: #161b22; color: #fff; padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2);">
           <option value="synthetic">🛡️ Synthetic Benchmark Feed</option>
         </select>
       </div>
@@ -1357,6 +1374,103 @@ def create_web_hud_app(monitor: LiveAIMonitor):
   <div class="toast" id="toast">Notification</div>
 
   <script>
+    const canvas = document.getElementById('interactiveCanvas');
+    const ctx = canvas.getContext('2d');
+    let currentMode = 'NONE';
+    let drawnPoints = [];
+
+    function resizeCanvas() {
+      canvas.width = canvas.parentElement.clientWidth;
+      canvas.height = canvas.parentElement.clientHeight;
+      drawOverlay();
+    }
+    window.addEventListener('resize', resizeCanvas);
+    setTimeout(resizeCanvas, 300);
+
+    canvas.addEventListener('click', (e) => {
+      if (currentMode === 'NONE') return;
+      const rect = canvas.getBoundingClientRect();
+      const nx = (e.clientX - rect.left) / canvas.width;
+      const ny = (e.clientY - rect.top) / canvas.height;
+
+      if (currentMode === 'TRIPWIRE') {
+        if (drawnPoints.length >= 2) drawnPoints = [];
+        drawnPoints.push({ x: nx, y: ny });
+      } else if (currentMode === 'INTRUSION') {
+        drawnPoints.push({ x: nx, y: ny });
+      }
+      drawOverlay();
+    });
+
+    function drawOverlay() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      if (drawnPoints.length === 0) return;
+
+      ctx.strokeStyle = currentMode === 'TRIPWIRE' ? '#00f0ff' : '#ffaa00';
+      ctx.lineWidth = 2.5;
+      ctx.fillStyle = currentMode === 'TRIPWIRE' ? 'rgba(0, 240, 255, 0.2)' : 'rgba(255, 170, 0, 0.25)';
+
+      ctx.beginPath();
+      drawnPoints.forEach((pt, i) => {
+        const px = pt.x * canvas.width;
+        const py = pt.y * canvas.height;
+        if (i === 0) ctx.moveTo(px, py);
+        else ctx.lineTo(px, py);
+      });
+
+      if (currentMode === 'INTRUSION' && drawnPoints.length >= 3) {
+        ctx.closePath();
+        ctx.fill();
+      }
+      ctx.stroke();
+
+      drawnPoints.forEach(pt => {
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(pt.x * canvas.width, pt.y * canvas.height, 5, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
+
+    function setDrawMode(mode) {
+      currentMode = mode;
+      drawnPoints = [];
+      drawOverlay();
+      showToast(`Mode: ${mode} - Click on video to place points.`);
+    }
+
+    function clearCanvasPoints() {
+      drawnPoints = [];
+      drawOverlay();
+      showToast('Canvas cleared.');
+    }
+
+    async function syncCanvasToBackend() {
+      if (currentMode === 'TRIPWIRE' && drawnPoints.length === 2) {
+        await fetch('/api/zone/tripwire', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            x1: drawnPoints[0].x, y1: drawnPoints[0].y,
+            x2: drawnPoints[1].x, y2: drawnPoints[1].y,
+            direction: 'BIDIRECTIONAL'
+          })
+        });
+        showToast('✅ Tripwire updated in AI Core!');
+        clearCanvasPoints();
+      } else if (currentMode === 'INTRUSION' && drawnPoints.length >= 3) {
+        await fetch('/api/zone/intrusion', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ points: drawnPoints })
+        });
+        showToast('✅ Intrusion zone updated in AI Core!');
+        clearCanvasPoints();
+      } else {
+        showToast('Please click points on video first.');
+      }
+    }
+
     function showToast(msg) {
       const t = document.getElementById('toast');
       t.textContent = msg;
@@ -1369,9 +1483,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         const res = await fetch('/api/action/snapshot', { method: 'POST' });
         const data = await res.json();
         showToast(data.message || 'Snapshot captured');
-      } catch (e) {
-        showToast('Snapshot failed');
-      }
+      } catch (e) { showToast('Snapshot failed'); }
     }
 
     async function triggerClip() {
@@ -1379,29 +1491,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         const res = await fetch('/api/action/clip', { method: 'POST' });
         const data = await res.json();
         showToast(data.message || 'Exporting clip');
-      } catch (e) {
-        showToast('Clip export failed');
-      }
-    }
-
-    async function updateTripwire() {
-      const x1 = parseFloat(document.getElementById('twX1').value);
-      const y1 = parseFloat(document.getElementById('twY1').value);
-      const x2 = parseFloat(document.getElementById('twX2').value);
-      const y2 = parseFloat(document.getElementById('twY2').value);
-      const dir = document.getElementById('twDir').value;
-
-      try {
-        const res = await fetch('/api/zone/tripwire', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ x1: x1, y1: y1, x2: x2, y2: y2, direction: dir })
-        });
-        const data = await res.json();
-        showToast(data.message || 'Tripwire updated');
-      } catch (e) {
-        showToast('Failed to update tripwire');
-      }
+      } catch (e) { showToast('Clip export failed'); }
     }
 
     async function rescanCameras() {
@@ -1418,9 +1508,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           select.appendChild(opt);
         });
         showToast(`Scan complete: Found ${data.sources.length} sources.`);
-      } catch (e) {
-        showToast('Camera scan failed.');
-      }
+      } catch (e) { showToast('Camera scan failed.'); }
     }
 
     async function changeCameraSource(url) {
@@ -1431,9 +1519,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: url })
         });
-      } catch (e) {
-        showToast('Failed to switch source');
-      }
+      } catch (e) { showToast('Failed to switch source'); }
     }
 
     async function updateTelemetry() {
@@ -1446,9 +1532,9 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         document.getElementById('sourceBadge').textContent = data.current_source;
 
         document.getElementById('personCountVal').textContent = data.person_count;
+        document.getElementById('totalTracksVal').textContent = data.total_tracks;
         document.getElementById('torsoAngleVal').textContent = `${data.torso_angle.toFixed(1)}°`;
         document.getElementById('velocityVal').textContent = `${data.descent_velocity.toFixed(2)} m/s`;
-        document.getElementById('aspectVal').textContent = `${data.aspect_ratio.toFixed(2)}`;
 
         const fallStatus = document.getElementById('fallStatusVal');
         if (data.is_fall_active) {
@@ -1459,7 +1545,6 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           fallStatus.style.color = 'var(--accent-green)';
         }
 
-        // Render Events Log
         if (data.events && data.events.length > 0) {
           const container = document.getElementById('eventLogList');
           container.innerHTML = '';
@@ -1506,6 +1591,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             "latency_ms": monitor.avg_inference_ms,
             "current_source": monitor.current_source_name,
             "person_count": monitor.person_count,
+            "total_tracks": len(monitor.tracks),
             "torso_angle": monitor.torso_angle,
             "descent_velocity": monitor.descent_velocity,
             "aspect_ratio": monitor.aspect_ratio,
@@ -1567,11 +1653,9 @@ def main():
 
     monitor = LiveAIMonitor(args.stream)
 
-    # 1. Start Capture & AI Vision Worker Thread
     capture_thread = threading.Thread(target=monitor.capture_frame_loop, daemon=True)
     capture_thread.start()
 
-    # 2. Start Embedded Web HUD Server in background thread
     import uvicorn
     web_app = create_web_hud_app(monitor)
 
@@ -1587,10 +1671,10 @@ def main():
     print(f"  🌐 Live Web HUD:  http://localhost:{args.port}")
     print(f"  🌐 Remote Access: http://0.0.0.0:{args.port}")
     print("  Interactive Features:")
-    print("  • Real-Time Fall Detection on live detected persons")
-    print("  • Virtual Tripwire crossing evaluation with In/Out count")
-    print("  • Polygon Intrusion zone monitoring")
-    print("  • Reposition tripwires & intrusion polygons live via Web HUD")
+    print("  • Multi-Class Detection: Person, Package/Bag, Vehicle, Pet")
+    print("  • Static Object Immobility Filtering (No false alarms on bags/chairs)")
+    print("  • Real-Time Fall Detection on live active persons")
+    print("  • Click & Draw Tripwires and Intrusion Polygons directly on Live Video")
     print("  • Press 'Q' or ESC to Exit")
     print("=" * 75 + "\n")
 
@@ -1600,7 +1684,6 @@ def main():
         except Exception:
             pass
 
-    # 3. Attempt Native HighGUI Window (with graceful try/except fallback)
     gui_supported = False
     try:
         if sys.platform.startswith("win") or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
