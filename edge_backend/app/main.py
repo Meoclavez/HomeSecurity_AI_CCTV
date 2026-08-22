@@ -1,5 +1,6 @@
 """Edge AI CCTV Surveillance Core - FastAPI Application Entrypoint."""
 
+import os
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -136,35 +137,37 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to seed default cameras: {e}")
 
-    # 3. Start AI Video Ingest & 24/7 Segmented DVR Workers
-    try:
-        async with async_session_factory() as session:
-            res = await session.execute(select(CameraModel))
-            cameras_list = res.scalars().all()
-            for camera in cameras_list:
-                try:
-                    await video_ingest_service.register_and_start_camera(camera.id, camera.rtsp_url)
-                    if camera.dvr_enabled:
-                        dvr_recorder_service.start_camera_dvr(camera.id, camera.rtsp_url)
-                    health_tracker.record_success(f"rtsp_{camera.id}")
-                except Exception as e:
-                    logger.warning(f"Could not auto-start ingest/DVR for {camera.id}: {e}")
-                    health_tracker.record_failure(f"rtsp_{camera.id}", str(e))
-    except Exception as e:
-        logger.error(f"Failed to load cameras for auto-start: {e}")
-
-    # 4. Start mDNS Zeroconf Broadcaster for local Flutter app discovery
-    try:
-        await mdns_advertiser.start()
-    except Exception as e:
-        logger.warning(f"mDNS advertiser failed to start: {e}")
-
-    # 5. Start background DVR indexer and storage cleaner
+    # 3. Start AI Video Ingest & 24/7 Segmented DVR Workers (skip during automated testing)
     cleaner_task = None
-    try:
-        cleaner_task = asyncio.create_task(periodic_dvr_indexer_and_cleaner())
-    except Exception as e:
-        logger.warning(f"DVR background cleaner failed to start: {e}")
+    is_testing = bool(os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TESTING"))
+    if not is_testing:
+        try:
+            async with async_session_factory() as session:
+                res = await session.execute(select(CameraModel))
+                cameras_list = res.scalars().all()
+                for camera in cameras_list:
+                    try:
+                        await video_ingest_service.register_and_start_camera(camera.id, camera.rtsp_url)
+                        if camera.dvr_enabled:
+                            dvr_recorder_service.start_camera_dvr(camera.id, camera.rtsp_url)
+                        health_tracker.record_success(f"rtsp_{camera.id}")
+                    except Exception as e:
+                        logger.warning(f"Could not auto-start ingest/DVR for {camera.id}: {e}")
+                        health_tracker.record_failure(f"rtsp_{camera.id}", str(e))
+        except Exception as e:
+            logger.error(f"Failed to load cameras for auto-start: {e}")
+
+        # 4. Start mDNS Zeroconf Broadcaster for local Flutter app discovery
+        try:
+            await mdns_advertiser.start()
+        except Exception as e:
+            logger.warning(f"mDNS advertiser failed to start: {e}")
+
+        # 5. Start background DVR indexer and storage cleaner
+        try:
+            cleaner_task = asyncio.create_task(periodic_dvr_indexer_and_cleaner())
+        except Exception as e:
+            logger.error(f"Failed to start DVR cleaner: {e}")
 
     yield
 
@@ -219,13 +222,15 @@ from fastapi import Request
 
 @app.middleware("http")
 async def setup_check_middleware(request: Request, call_next):
-    # Bypass for setup routes, auth routes, health check, docs, root, and CORS OPTIONS preflights
+    # Bypass for setup routes, auth routes, health check, docs, root, internal vision key, and CORS OPTIONS preflights
     path = request.url.path
+    api_key_hdr = request.headers.get("X-Edge-API-Key")
     if (
         request.method == "OPTIONS"
         or path.startswith("/api/v1/setup")
         or path.startswith("/api/v1/auth")
         or path.startswith("/api/v1/health")
+        or (api_key_hdr and api_key_hdr == settings.INTERNAL_SERVICE_KEY)
         or path in ("/", "/docs", "/openapi.json", "/favicon.ico")
     ):
         return await call_next(request)

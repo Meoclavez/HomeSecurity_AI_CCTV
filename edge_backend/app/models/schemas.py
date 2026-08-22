@@ -121,6 +121,7 @@ class SecurityEventBase(BaseModel):
     keypoints: Optional[List[Keypoint]] = None
     kinematics: Optional[KinematicTelemetry] = None
     metadata_json: Optional[Dict[str, Any]] = None
+    metadata: Optional[Dict[str, Any]] = None
 
 
 class SecurityEventCreate(SecurityEventBase):

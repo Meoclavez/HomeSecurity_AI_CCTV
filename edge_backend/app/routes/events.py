@@ -77,7 +77,7 @@ async def trigger_event(
         bounding_box=event_in.bounding_box.dict() if event_in.bounding_box else None,
         keypoints=[k.dict() for k in event_in.keypoints] if event_in.keypoints else None,
         kinematics=event_in.kinematics.dict() if event_in.kinematics else None,
-        metadata_payload=event_in.metadata,
+        metadata_json=getattr(event_in, "metadata", None) or getattr(event_in, "metadata_json", None),
         acknowledged=False,
     )
     db.add(db_event)
