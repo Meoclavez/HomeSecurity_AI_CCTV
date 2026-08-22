@@ -120,60 +120,112 @@ class ZoneAlertDebouncer:
 # Unified Robust Person Detector (DNN + Morphological Body Merger & NMS)
 # ==============================================================================
 class UnifiedPersonDetector:
-    """Detects whole human bodies without fragmenting limbs or false aspect ratio distortions."""
+    """Deep Learning Neural Network Person Detector via OpenCV DNN with Letterbox Preprocessing."""
 
     def __init__(self, onnx_model_path: Optional[str] = None):
+        if onnx_model_path is None:
+            default_path = PROJECT_ROOT / "edge_backend" / "models" / "yolov5n.onnx"
+            if default_path.exists():
+                onnx_model_path = str(default_path)
+
         self.net = None
         self.use_dnn = False
 
-        # 1. Attempt loading ONNX model (YOLOv8 / MobileNet-SSD)
+        # 1. Attempt loading ONNX model (YOLOv5 / YOLOv8 / MobileNet-SSD)
         if onnx_model_path and os.path.exists(onnx_model_path):
             try:
                 self.net = cv2.dnn.readNetFromONNX(onnx_model_path)
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
                 self.use_dnn = True
-                logger.info(f"✅ OpenCV DNN loaded successfully: {onnx_model_path}")
+                logger.info(f"✅ OpenCV Deep Neural Network loaded: {onnx_model_path}")
             except Exception as e:
-                logger.warning(f"[-] Failed to load ONNX model ({e}). Using Morphological Body Merger.")
+                logger.warning(f"[-] Could not load ONNX model ({e}). Using Morphological Body Merger.")
                 self.use_dnn = False
 
         # Fallback Motion & Morphological Segmenter
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=24, detectShadows=False)
-        # Tall vertical structuring element designed to bridge Head -> Torso -> Arms -> Legs
-        self.vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (11, 35))
+        self.vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 45))
         self.horizontal_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+
+    def _letterbox(
+        self,
+        img: np.ndarray,
+        new_shape: Tuple[int, int] = (640, 640),
+        color: Tuple[int, int, int] = (114, 114, 114)
+    ) -> Tuple[np.ndarray, float, Tuple[float, float]]:
+        shape = img.shape[:2]
+        r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+        new_unpad = (int(round(shape[1] * r)), int(round(shape[0] * r)))
+        dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+        dw /= 2
+        dh /= 2
+
+        if shape[::-1] != new_unpad:
+            img = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+        top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+        left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+        img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
+        return img, r, (dw, dh)
 
     def detect(self, frame: np.ndarray) -> List[Tuple[float, float, float, float, float]]:
         """Returns normalized bounding boxes: [(x1, y1, x2, y2, confidence), ...]"""
         h, w = frame.shape[:2]
         if self.use_dnn and self.net is not None:
-            return self._detect_dnn(frame, w, h)
+            try:
+                detections = self._detect_dnn(frame, w, h)
+                if detections:
+                    return detections
+            except Exception as e:
+                logger.warning(f"DNN inference error ({e}), falling back to morphological.")
         return self._detect_morphological_merged(frame, w, h)
 
     def _detect_dnn(self, frame: np.ndarray, w: int, h: int) -> List[Tuple[float, float, float, float, float]]:
-        blob = cv2.dnn.blobFromImage(frame, 1 / 255.0, (640, 640), swapRB=True, crop=False)
+        letterbox_img, ratio, (dw, dh) = self._letterbox(frame, (640, 640))
+        blob = cv2.dnn.blobFromImage(letterbox_img, 1.0 / 255.0, (640, 640), (0, 0, 0), swapRB=True, crop=False)
         self.net.setInput(blob)
         preds = self.net.forward()
 
+        # Handle YOLOv5 (1, 25200, 85) or YOLOv8 (1, 84, 8400)
         if len(preds.shape) == 3:
-            preds = np.transpose(preds[0], (1, 0))
+            if preds.shape[1] < preds.shape[2]:
+                preds = np.transpose(preds[0], (1, 0))
+            else:
+                preds = preds[0]
 
         boxes, confidences = [], []
-        for row in preds:
-            classes_scores = row[4:]
-            class_id = int(np.argmax(classes_scores))
-            score = float(classes_scores[class_id])
-            if class_id == 0 and score > 0.40:  # Class 0 = Person
-                cx, cy, bw, bh = row[0], row[1], row[2], row[3]
-                x1 = int((cx - bw / 2) * (w / 640.0))
-                y1 = int((cy - bh / 2) * (h / 640.0))
-                bw_px = int(bw * (w / 640.0))
-                bh_px = int(bh * (h / 640.0))
-                boxes.append([x1, y1, bw_px, bh_px])
-                confidences.append(score)
+        conf_thresh = 0.28
 
-        indices = cv2.dnn.NMSBoxes(boxes, confidences, score_threshold=0.40, nms_threshold=0.45)
+        for row in preds:
+            if preds.shape[1] == 85:  # YOLOv5 format
+                obj_conf = float(row[4])
+                if obj_conf > conf_thresh:
+                    person_score = float(row[5])  # Class 0 = Person
+                    total_score = obj_conf * person_score
+                    if total_score > conf_thresh:
+                        cx, cy, bw, bh = row[0], row[1], row[2], row[3]
+                        cx = (cx - dw) / ratio
+                        cy = (cy - dh) / ratio
+                        bw = bw / ratio
+                        bh = bh / ratio
+                        x1 = int(cx - bw / 2)
+                        y1 = int(cy - bh / 2)
+                        boxes.append([x1, y1, int(bw), int(bh)])
+                        confidences.append(total_score)
+            else:  # YOLOv8 format
+                person_score = float(row[4])
+                if person_score > conf_thresh:
+                    cx, cy, bw, bh = row[0], row[1], row[2], row[3]
+                    cx = (cx - dw) / ratio
+                    cy = (cy - dh) / ratio
+                    bw = bw / ratio
+                    bh = bh / ratio
+                    x1 = int(cx - bw / 2)
+                    y1 = int(cy - bh / 2)
+                    boxes.append([x1, y1, int(bw), int(bh)])
+                    confidences.append(person_score)
+
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, conf_thresh, 0.45)
         results = []
         if len(indices) > 0:
             for idx in indices.flatten():
