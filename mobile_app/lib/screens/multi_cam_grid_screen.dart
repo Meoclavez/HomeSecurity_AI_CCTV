@@ -73,10 +73,13 @@ class _MultiCamGridScreenState extends State<MultiCamGridScreen> {
               : LayoutBuilder(
                   builder: (context, constraints) {
                     int crossAxisCount = 1;
-                    if (constraints.maxWidth > 1200) {
-                      crossAxisCount = 3;
-                    } else if (constraints.maxWidth > 650) {
+                    int count = _cameras.length;
+                    if (count >= 5) {
+                      crossAxisCount = constraints.maxWidth > 800 ? 4 : 2;
+                    } else if (count >= 2) {
                       crossAxisCount = 2;
+                    } else {
+                      crossAxisCount = 1;
                     }
 
                     return GridView.builder(
@@ -199,6 +202,37 @@ class _MultiCamGridScreenState extends State<MultiCamGridScreen> {
                     Text(camera.name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 11)),
                   ],
                 ),
+              ),
+            ),
+            Positioned(
+              top: 10,
+              right: 10,
+              child: Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.black.withOpacity(0.7),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: Text('30 FPS', style: const TextStyle(color: Colors.greenAccent, fontSize: 9, fontWeight: FontWeight.bold)),
+                  ),
+                  const SizedBox(width: 4),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: Colors.red.withOpacity(0.8),
+                      borderRadius: BorderRadius.circular(4),
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(Icons.warning_amber_rounded, size: 10, color: Colors.white),
+                        SizedBox(width: 2),
+                        Text('1', style: TextStyle(color: Colors.white, fontSize: 9, fontWeight: FontWeight.bold)),
+                      ],
+                    ),
+                  ),
+                ],
               ),
             ),
             Positioned(

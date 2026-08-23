@@ -122,22 +122,53 @@ class ZoneCanvasPainter extends CustomPainter {
 
       if (zone.zoneType == ZoneType.privacyMask) {
         final maskPaint = Paint()
-          ..color = Colors.black.withOpacity(0.85)
+          ..color = Colors.purple.withOpacity(0.3)
           ..style = PaintingStyle.fill;
         canvas.drawPath(path, maskPaint);
+        
+        final strokePaint = Paint()
+          ..color = Colors.cyanAccent
+          ..strokeWidth = isDraft ? 2.5 : 2.0
+          ..style = PaintingStyle.stroke;
+        canvas.drawPath(path, strokePaint);
+
         _drawHatchPattern(canvas, path, Colors.white24);
+
+        // Draw badge
+        final bounds = path.getBounds();
+        final badgeCenter = Offset(bounds.center.dx, bounds.center.dy);
+        
+        final textSpan = TextSpan(
+          text: '🌫️ EXCLUSION / PRIVACY MASK\n${zone.maskMode.name.toUpperCase()}',
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 10,
+            fontWeight: FontWeight.bold,
+            backgroundColor: Colors.black54,
+          ),
+        );
+        final textPainter = TextPainter(
+          text: textSpan,
+          textAlign: TextAlign.center,
+          textDirection: TextDirection.ltr,
+        );
+        textPainter.layout();
+        textPainter.paint(
+            canvas, 
+            Offset(badgeCenter.dx - textPainter.width / 2, badgeCenter.dy - textPainter.height / 2));
+
       } else {
         final fillPaint = Paint()
           ..color = (isDraft ? AppTheme.cyberBlue : baseColor).withOpacity(0.22)
           ..style = PaintingStyle.fill;
         canvas.drawPath(path, fillPaint);
-      }
 
-      final strokePaint = Paint()
-        ..color = isDraft ? AppTheme.cyberBlue : baseColor
-        ..strokeWidth = isDraft ? 2.5 : 2.0
-        ..style = PaintingStyle.stroke;
-      canvas.drawPath(path, strokePaint);
+        final strokePaint = Paint()
+          ..color = isDraft ? AppTheme.cyberBlue : baseColor
+          ..strokeWidth = isDraft ? 2.5 : 2.0
+          ..style = PaintingStyle.stroke;
+        canvas.drawPath(path, strokePaint);
+      }
 
       for (int i = 0; i < zone.polygonPoints.length; i++) {
         final pt = toCanvas(zone.polygonPoints[i]);

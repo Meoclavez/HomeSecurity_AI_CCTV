@@ -160,3 +160,10 @@ Edge_AI_CCTV/
 * `POST /api/v1/cameras/{camera_id}/zones`: Create or update a zone configuration.
 * `DELETE /api/v1/cameras/{camera_id}/zones/{zone_id}`: Delete a zone configuration.
 * `POST /api/v1/cameras/{camera_id}/mute`: Mute camera alerts for X minutes (invoked from lockscreen action).
+
+### Web HUD Studio Zones & Clips (`/api/zones`, `/api/action`)
+* `GET /api/zones`: List tripwires, intrusion zones, and exclusion masks.
+* `POST /api/zones/exclusion`: Create or update an exclusion/privacy mask.
+* `DELETE /api/zones/exclusion/{id}`: Delete an exclusion mask.
+* `POST /api/action/clip`: Manually export 10s MP4 clip (15s automated clips triggered by Tripwire/Intrusion).
+* `POST /api/switch_source`: Switch camera feed from top navbar.

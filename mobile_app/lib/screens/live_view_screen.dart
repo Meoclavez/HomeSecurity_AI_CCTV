@@ -21,9 +21,13 @@ class LiveViewScreen extends StatefulWidget {
 
 class _LiveViewScreenState extends State<LiveViewScreen> {
   final WebRtcService _webrtcService = WebRtcService();
+  final ApiService _apiService = ApiService();
   bool _isConnecting = true;
   String? _error;
   bool _isMuted = false;
+
+  late CameraFeed _currentCamera;
+  List<CameraFeed> _cameras = [];
 
   late List<TimelineRecordingSegment> _recordingSegments;
   late List<TimelineEventPin> _eventPins;
@@ -31,7 +35,29 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
   @override
   void initState() {
     super.initState();
+    _currentCamera = widget.camera;
     _initTimelineMockData();
+    _initAndConnect();
+    _loadCameras();
+  }
+
+  Future<void> _loadCameras() async {
+    try {
+      final list = await _apiService.getCameras();
+      setState(() {
+        _cameras = list;
+      });
+    } catch (e) {
+      debugPrint('Error loading cameras: $e');
+    }
+  }
+
+  void _switchCamera(CameraFeed newCam) {
+    if (newCam.id == _currentCamera.id) return;
+    setState(() {
+      _currentCamera = newCam;
+      _initTimelineMockData();
+    });
     _initAndConnect();
   }
 
@@ -45,9 +71,9 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
       TimelineEventPin(
         event: SecurityEvent(
           id: 'ev_01',
-          cameraId: widget.camera.id,
-          cameraName: widget.camera.name,
-          location: widget.camera.location,
+          cameraId: _currentCamera.id,
+          cameraName: _currentCamera.name,
+          location: _currentCamera.location,
           eventType: 'FALL_DETECTED',
           severity: 'CRITICAL',
           confidence: 0.96,
@@ -65,7 +91,7 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
     });
     try {
       await _webrtcService.initialize();
-      await _webrtcService.connect(widget.camera.id, enableBackchannel: true);
+      await _webrtcService.connect(_currentCamera.id, enableBackchannel: true);
       setState(() => _isConnecting = false);
     } catch (e) {
       setState(() {
@@ -84,7 +110,7 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
   @override
   Widget build(BuildContext context) {
     return BiometricGate(
-      promptReason: 'Authenticate to view secure camera ${widget.camera.name}',
+      promptReason: 'Authenticate to view secure camera ${_currentCamera.name}',
       child: Scaffold(
         backgroundColor: Colors.black,
         appBar: AppBar(
@@ -92,8 +118,8 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
           title: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(widget.camera.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-              Text('${widget.camera.location} • WebRTC <300ms + 2-Way Audio', style: const TextStyle(fontSize: 11, color: AppTheme.liveGreen)),
+              Text(_currentCamera.name, style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+              Text('${_currentCamera.location} • WebRTC <300ms + 2-Way Audio', style: const TextStyle(fontSize: 11, color: AppTheme.liveGreen)),
             ],
           ),
           actions: [
@@ -110,6 +136,32 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
         body: SafeArea(
           child: Column(
             children: [
+              if (_cameras.isNotEmpty)
+                Container(
+                  height: 40,
+                  margin: const EdgeInsets.symmetric(vertical: 8),
+                  child: ListView.builder(
+                    scrollDirection: Axis.horizontal,
+                    itemCount: _cameras.length,
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    itemBuilder: (context, index) {
+                      final cam = _cameras[index];
+                      final isSelected = cam.id == _currentCamera.id;
+                      return Padding(
+                        padding: const EdgeInsets.only(right: 8),
+                        child: ChoiceChip(
+                          label: Text(cam.name, style: TextStyle(fontSize: 12, color: isSelected ? Colors.black : Colors.white)),
+                          selected: isSelected,
+                          selectedColor: AppTheme.cyberBlue,
+                          backgroundColor: AppTheme.cardSurface,
+                          onSelected: (val) {
+                            if (val) _switchCamera(cam);
+                          },
+                        ),
+                      );
+                    },
+                  ),
+                ),
               // 1. Live WebRTC Video Viewport
               Expanded(
                 flex: 5,

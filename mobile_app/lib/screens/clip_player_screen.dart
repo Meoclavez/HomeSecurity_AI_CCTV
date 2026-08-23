@@ -65,6 +65,14 @@ class _ClipPlayerScreenState extends State<ClipPlayerScreen> {
         title: Text(widget.event.eventType.replaceAll('_', ' '), style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         actions: [
           IconButton(
+            icon: const Icon(Icons.download_rounded),
+            onPressed: () {
+              ScaffoldMessenger.of(context).showSnackBar(
+                const SnackBar(content: Text('Downloading 15s MP4 clip...')),
+              );
+            },
+          ),
+          IconButton(
             icon: const Icon(Icons.share),
             onPressed: () {
               ScaffoldMessenger.of(context).showSnackBar(
@@ -170,8 +178,33 @@ class _ClipPlayerScreenState extends State<ClipPlayerScreen> {
                     Text('Detected: $timeStr', style: const TextStyle(color: Colors.white70, fontSize: 13)),
                     const SizedBox(height: 4),
                     Text('AI Confidence: ${(widget.event.confidence * 100).toStringAsFixed(1)}%', style: const TextStyle(color: AppTheme.liveGreen, fontSize: 13)),
+                    const SizedBox(height: 12),
+                    Wrap(
+                      spacing: 8,
+                      children: [
+                        if (widget.event.eventType.contains('TRIPWIRE') || true) // Mock condition since we just want to display
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                            decoration: BoxDecoration(
+                              color: Colors.blueAccent.withOpacity(0.2),
+                              borderRadius: BorderRadius.circular(4),
+                              border: Border.all(color: Colors.blueAccent),
+                            ),
+                            child: const Text('TRIPWIRE: A -> B', style: TextStyle(color: Colors.blueAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+                          ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.redAccent.withOpacity(0.2),
+                            borderRadius: BorderRadius.circular(4),
+                            border: Border.all(color: Colors.redAccent),
+                          ),
+                          child: const Text('RESTRICTED ZONE', style: TextStyle(color: Colors.redAccent, fontSize: 11, fontWeight: FontWeight.bold)),
+                        ),
+                      ],
+                    ),
                     const SizedBox(height: 20),
-                    const Text('Buffer Specs: 5s Pre-Event + 10s Post-Event MP4 (+faststart)', style: TextStyle(color: Colors.white38, fontSize: 11)),
+                    const Text('Buffer Specs: 5s Pre-Event + 10s Post-Event MP4 (+faststart) • 15s Total', style: TextStyle(color: Colors.white38, fontSize: 11)),
                   ],
                 ),
               ),

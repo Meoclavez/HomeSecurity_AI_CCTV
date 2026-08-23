@@ -272,13 +272,32 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
                     children: [
                       _buildToolChip(ZoneType.intrusion, 'Intrusion', Icons.security_rounded, AppTheme.emergencyRed),
                       _buildToolChip(ZoneType.tripwire, 'Tripwire', Icons.timeline_rounded, AppTheme.warningOrange),
-                      _buildToolChip(ZoneType.privacyMask, 'Privacy Mask', Icons.blur_on_rounded, Colors.grey),
+                      _buildToolChip(ZoneType.privacyMask, 'Blur & Exclude Area', Icons.blur_on_rounded, Colors.grey),
                       _buildToolChip(ZoneType.door, 'Door ROI', Icons.door_front_door_outlined, AppTheme.cyberBlue),
                       _buildToolChip(ZoneType.package, 'Package Zone', Icons.inventory_2_outlined, AppTheme.liveGreen),
                     ],
                   ),
                 ),
                 const SizedBox(height: 12),
+                if (_selectedTool == ZoneType.privacyMask) ...[
+                  const Padding(
+                    padding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                    child: Text('MASK MODE', style: TextStyle(color: Colors.white54, fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 1)),
+                  ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        _buildMaskModeChip(MaskMode.blur, 'Blur'),
+                        _buildMaskModeChip(MaskMode.blackout, 'Blackout'),
+                        _buildMaskModeChip(MaskMode.mosaic, 'Mosaic'),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                ],
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 12),
                   child: Row(
@@ -437,6 +456,26 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
             _selectedTool = type;
             if (_activeDraftZone != null) {
               _activeDraftZone!.zoneType = type;
+            }
+          });
+        }
+      },
+    );
+  }
+
+  Widget _buildMaskModeChip(MaskMode mode, String label) {
+    final isSelected = _maskMode == mode;
+    return ChoiceChip(
+      label: Text(label, style: TextStyle(fontSize: 11, color: isSelected ? Colors.black : Colors.white)),
+      selected: isSelected,
+      selectedColor: AppTheme.cyberBlue,
+      backgroundColor: AppTheme.darkBackground,
+      onSelected: (val) {
+        if (val) {
+          setState(() {
+            _maskMode = mode;
+            if (_activeDraftZone != null) {
+              _activeDraftZone!.maskMode = mode;
             }
           });
         }

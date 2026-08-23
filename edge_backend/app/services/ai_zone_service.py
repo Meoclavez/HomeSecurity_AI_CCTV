@@ -555,6 +555,16 @@ class AIZoneService:
         privacy = self.get_or_create_privacy_engine(camera_id)
         return privacy.apply_privacy_masks(frame)
 
+    def is_detection_in_exclusion_mask(self, bbox: BoundingBox, masks: List[ZoneConfig]) -> bool:
+        """If an object detection lies inside any enabled exclusion/privacy mask polygon, suppress and filter it out."""
+        for mask_cfg in masks:
+            if not mask_cfg.polygon_points or len(mask_cfg.polygon_points) < 3:
+                continue
+            poly = [(float(p.x), float(p.y)) for p in mask_cfg.polygon_points]
+            if PolygonGeometry.is_bbox_in_polygon(bbox, poly):
+                return True
+        return False
+
     def process_detections(
         self,
         camera_id: str,
@@ -562,7 +572,7 @@ class AIZoneService:
         frame_w: int = 640,
         frame_h: int = 360
     ) -> List[SecurityEventCreate]:
-        self.get_or_create_privacy_engine(camera_id)
+        privacy = self.get_or_create_privacy_engine(camera_id)
         tracker = self.zone_trackers.get(camera_id)
         if not tracker:
             return []
@@ -571,7 +581,9 @@ class AIZoneService:
         if isinstance(detections, list):
             for d in detections:
                 if isinstance(d, tuple) and len(d) == 2:
-                    converted.append(d)
+                    track_id, bbox = d
+                    if not self.is_detection_in_exclusion_mask(bbox, privacy.masks):
+                        converted.append(d)
                 elif isinstance(d, dict):
                     track_id = d.get("track_id", 0)
                     bbox_coords = d.get("bbox", [0.0, 0.0, 1.0, 1.0])
@@ -583,7 +595,8 @@ class AIZoneService:
                         confidence=float(d.get("confidence", 0.9)),
                         label=d.get("class_name", "person")
                     )
-                    converted.append((track_id, bbox))
+                    if not self.is_detection_in_exclusion_mask(bbox, privacy.masks):
+                        converted.append((track_id, bbox))
 
         return tracker.process_detections(converted)
 

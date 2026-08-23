@@ -5,7 +5,7 @@ import logging
 from datetime import datetime
 from typing import List, Optional
 from pathlib import Path
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Query, Depends
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Query, Depends, WebSocket
 from fastapi.responses import FileResponse, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
@@ -116,11 +116,39 @@ async def trigger_event(
             timestamp=datetime.utcnow(),
             snapshot_url=snapshot_url,
             clip_url=clip_url,
+            metadata=getattr(event_in, "metadata", None) or getattr(event_in, "metadata_json", None),
             acknowledged=False
         )
         await notification_service.dispatch_event_notification(event_pydantic)
 
     background_tasks.add_task(process_and_notify)
+
+    # Broadcast to active WebSocket clients
+    from fastapi.encoders import jsonable_encoder
+    import asyncio as aio
+    
+    event_dict = jsonable_encoder(SecurityEvent(
+        id=event_id,
+        camera_id=event_in.camera_id,
+        camera_name=camera_name,
+        location=location,
+        event_type=event_in.event_type,
+        severity=event_in.severity,
+        confidence=event_in.confidence,
+        timestamp=datetime.utcnow(),
+        snapshot_url=snapshot_url,
+        clip_url=None,
+        bounding_box=event_in.bounding_box,
+        keypoints=event_in.keypoints,
+        kinematics=event_in.kinematics,
+        metadata=getattr(event_in, "metadata", None) or getattr(event_in, "metadata_json", None),
+        acknowledged=False,
+    ))
+    
+    async def broadcast_ws():
+        await ws_manager.broadcast_event(event_dict)
+    
+    background_tasks.add_task(broadcast_ws)
 
     return SecurityEvent(
         id=event_id,
@@ -136,8 +164,45 @@ async def trigger_event(
         bounding_box=event_in.bounding_box,
         keypoints=event_in.keypoints,
         kinematics=event_in.kinematics,
+        metadata=getattr(event_in, "metadata", None) or getattr(event_in, "metadata_json", None),
         acknowledged=False,
     )
+
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast_event(self, event_data: dict):
+        dead_connections = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_json(event_data)
+            except Exception:
+                dead_connections.append(connection)
+        
+        for dead in dead_connections:
+            self.disconnect(dead)
+
+ws_manager = ConnectionManager()
+
+@router.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            # We just keep the connection open and listen to ping/pong
+            _ = await websocket.receive_text()
+    except Exception:
+        ws_manager.disconnect(websocket)
+
 
 
 @router.get("", response_model=SecurityEventListResponse)
