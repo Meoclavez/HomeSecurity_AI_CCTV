@@ -206,9 +206,8 @@ class UnifiedPersonDetector:
         h, w = frame.shape[:2]
         if self.use_dnn and self.net is not None:
             try:
-                detections = self._detect_dnn(frame, w, h)
-                if detections:
-                    return detections
+                # Return DNN results directly even if empty (prevents lighting-change false alarms)
+                return self._detect_dnn(frame, w, h)
             except Exception as e:
                 logger.warning(f"DNN inference error ({e}), falling back to morphological.")
         return self._detect_morphological_merged(frame, w, h)
@@ -948,6 +947,17 @@ class LiveAIMonitor:
         self.stream_source = "synthetic"
         self.current_source_name = "Synthetic Benchmark Feed"
 
+    @staticmethod
+    def _compute_iou(boxA: Tuple[float, float, float, float], boxB: Tuple[float, float, float, float]) -> float:
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+        interArea = max(0.0, xB - xA) * max(0.0, yB - yA)
+        boxAArea = max(1e-6, (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
+        boxBArea = max(1e-6, (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
+        return interArea / (boxAArea + boxBArea - interArea)
+
     def update_tracks(self, detections: List[DetectionObject]):
         now = time.time()
         updated_tracks = set()
@@ -957,17 +967,30 @@ class LiveAIMonitor:
             cy = (det.bbox[1] + det.bbox[3]) / 2.0
 
             best_track_id = None
-            min_dist = 0.28
+            best_score = float('inf')
 
+            # 1. Primary Association: IoU Spatial Overlap
             for tid, t in self.tracks.items():
-                if tid in updated_tracks:
+                if tid in updated_tracks or t.class_name != det.class_name:
                     continue
-                tx1, ty1, tx2, ty2 = t.bbox
-                tcx, tcy = (tx1 + tx2) / 2.0, (ty1 + ty2) / 2.0
-                dist = math.hypot(cx - tcx, cy - tcy)
-                if dist < min_dist:
-                    min_dist = dist
-                    best_track_id = tid
+                iou = self._compute_iou(det.bbox, t.bbox)
+                if iou >= 0.20:
+                    score = 1.0 - iou
+                    if score < best_score:
+                        best_score = score
+                        best_track_id = tid
+
+            # 2. Secondary Association: Centroid Proximity
+            if best_track_id is None:
+                for tid, t in self.tracks.items():
+                    if tid in updated_tracks or t.class_name != det.class_name:
+                        continue
+                    tx1, ty1, tx2, ty2 = t.bbox
+                    tcx, tcy = (tx1 + tx2) / 2.0, (ty1 + ty2) / 2.0
+                    dist = math.hypot(cx - tcx, cy - tcy)
+                    if dist < 0.22 and dist < best_score:
+                        best_score = dist
+                        best_track_id = tid
 
             if best_track_id is None:
                 best_track_id = self.next_track_id
@@ -1162,6 +1185,7 @@ class LiveAIMonitor:
     def capture_frame_loop(self):
         self.open_video_source()
         last_time = time.time()
+        last_rx_frame_time = time.time()
 
         while self.is_running:
             loop_start = time.time()
@@ -1171,7 +1195,13 @@ class LiveAIMonitor:
                 ret, raw_frame = self.cap.read()
                 if ret and raw_frame is not None:
                     frame = raw_frame
+                    last_rx_frame_time = time.time()
                 else:
+                    # Stream Health Watchdog: Reconnect if RTSP socket freezes without FIN
+                    if (time.time() - last_rx_frame_time) > 4.0 and self.stream_source != "synthetic":
+                        logger.warning(f"⚠️ Stream timeout from {self.current_source_name}. Reconnecting...")
+                        self.open_video_source()
+                        last_rx_frame_time = time.time()
                     frame = self.generate_synthetic_frame()
             else:
                 frame = self.generate_synthetic_frame()
@@ -1182,9 +1212,9 @@ class LiveAIMonitor:
 
             h, w = frame.shape[:2]
             detections_for_zones = []
-            # Only evaluate confirmed active tracks in security zones
+            # Pass all confirmed tracks to preserve spatial zone history when sitting/stationary
             for tid, t in self.tracks.items():
-                if t.motion_state != MotionState.STATIC_ANCHOR and t.is_confirmed:
+                if t.is_confirmed:
                     detections_for_zones.append({
                         "track_id": tid,
                         "class_name": t.class_name,

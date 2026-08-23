@@ -72,15 +72,16 @@ class PolygonGeometry:
         c1 = PolygonGeometry._is_left(p_prev, p_curr, w_start)
         c2 = PolygonGeometry._is_left(p_prev, p_curr, w_end)
 
-        if (d1 * d2 < 0.0) and (c1 * c2 < 0.0):
-            if d1 > 0 and d2 < 0:
+        # Handle collinear and cross-line intersections with <= 0.0
+        if (d1 * d2 <= 0.0) and (c1 * c2 <= 0.0):
+            if d1 >= 0 and d2 <= 0:
                 return TripwireDirection.A_TO_B
-            elif d1 < 0 and d2 > 0:
+            elif d1 <= 0 and d2 >= 0:
                 return TripwireDirection.B_TO_A
 
     @staticmethod
     def is_bbox_in_polygon(bbox: BoundingBox, polygon: List[Tuple[float, float]]) -> bool:
-        """Checks if any anatomical body point (feet, centroid, torso, chest) is inside the polygon."""
+        """Checks if any anatomical body point or reciprocal polygon vertex is inside."""
         cx = (bbox.x_min + bbox.x_max) / 2.0
         points_to_check = [
             (cx, bbox.y_max),                                         # Feet / footprint
@@ -93,6 +94,12 @@ class PolygonGeometry:
         for pt in points_to_check:
             if PolygonGeometry.point_in_polygon_raycasting(pt, polygon):
                 return True
+
+        # Reciprocal check: If a small polygon is entirely inside the bounding box
+        for px, py in polygon:
+            if bbox.x_min <= px <= bbox.x_max and bbox.y_min <= py <= bbox.y_max:
+                return True
+
         return False
 
 
@@ -180,6 +187,7 @@ class TrackSpatialState:
     last_position: Tuple[float, float]
     last_bbox: Optional[BoundingBox] = None
     entry_timestamps: Dict[str, float] = field(default_factory=dict)
+    exit_timestamps: Dict[str, float] = field(default_factory=dict)
     last_tripwire_alerts: Dict[str, float] = field(default_factory=dict)
     last_intrusion_alerts: Dict[str, float] = field(default_factory=dict)
     last_seen: float = field(default_factory=time.time)
@@ -253,19 +261,15 @@ class ZoneAnalyticsTracker:
                         
                         # Test multi-point spine trajectory (head, chest, torso, waist, feet)
                         crossing = None
-                        spine_fractions = [0.15, 0.35, 0.50, 0.70, 0.85, 1.0]
-                        for frac in spine_fractions:
-                            p_prev = (
-                                (prev_bbox.x_min + prev_bbox.x_max) / 2.0,
-                                prev_bbox.y_min + frac * (prev_bbox.y_max - prev_bbox.y_min)
-                            )
-                            p_curr = (
-                                (bbox.x_min + bbox.x_max) / 2.0,
-                                bbox.y_min + frac * (bbox.y_max - bbox.y_min)
-                            )
-                            c = PolygonGeometry.check_line_crossing(p_prev, p_curr, w_start, w_end)
-                            if c:
-                                crossing = c
+                        fractions = [0.15, 0.35, 0.50, 0.70, 0.85, 1.0]
+                        prev_cx = (prev_bbox.x_min + prev_bbox.x_max) / 2.0
+                        curr_cx = (bbox.x_min + bbox.x_max) / 2.0
+
+                        for frac in fractions:
+                            p_prev_pt = (prev_cx, prev_bbox.y_min + frac * (prev_bbox.y_max - prev_bbox.y_min))
+                            p_curr_pt = (curr_cx, bbox.y_min + frac * (bbox.y_max - bbox.y_min))
+                            crossing = PolygonGeometry.check_line_crossing(p_prev_pt, p_curr_pt, w_start, w_end)
+                            if crossing:
                                 break
 
                         if crossing:
@@ -312,6 +316,7 @@ class ZoneAnalyticsTracker:
                         is_inside = PolygonGeometry.is_bbox_in_polygon(bbox, poly)
 
                         if is_inside:
+                            track_state.exit_timestamps.pop(zone_id, None)
                             if zone_id not in track_state.entry_timestamps:
                                 track_state.entry_timestamps[zone_id] = now
 
@@ -337,8 +342,13 @@ class ZoneAnalyticsTracker:
                                         )
                                     )
                         else:
-                            track_state.entry_timestamps.pop(zone_id, None)
-                            track_state.last_intrusion_alerts.pop(zone_id, None)
+                            # Debounce exit: wait 1.5 seconds before resetting dwell timer
+                            if zone_id not in track_state.exit_timestamps:
+                                track_state.exit_timestamps[zone_id] = now
+                            elif (now - track_state.exit_timestamps[zone_id]) >= 1.5:
+                                track_state.entry_timestamps.pop(zone_id, None)
+                                track_state.last_intrusion_alerts.pop(zone_id, None)
+                                track_state.exit_timestamps.pop(zone_id, None)
                     except Exception as e:
                         logger.error(f"Error evaluating polygon intrusion zone {zone_id}: {e}")
                         continue
@@ -353,7 +363,7 @@ class ZoneAnalyticsTracker:
 # ---------------- 4. Temporal Security State Machines ----------------
 
 class DoorStateMachine:
-    """Monitors door open/closed status with debounce hysteresis and timeout alert."""
+    """Monitors door open/closed status with monotonic time debounce and timeout alert."""
 
     def __init__(self, camera_id: str, timeout_seconds: float = settings.DOOR_OPEN_ALERT_TIMEOUT_SEC):
         self.camera_id = camera_id
@@ -361,29 +371,22 @@ class DoorStateMachine:
         self.is_open = False
         self.opened_at: Optional[float] = None
         self.alert_dispatched = False
-        self.consecutive_open_frames = 0
-        self.consecutive_closed_frames = 0
-        self.hysteresis_threshold = 5
+        self.state_change_time: Optional[float] = None
+        self.hysteresis_sec = 0.5
 
     def update(self, is_door_open: bool, bbox: Optional[BoundingBox] = None) -> Optional[SecurityEventCreate]:
         now = time.time()
 
-        if is_door_open:
-            self.consecutive_open_frames += 1
-            self.consecutive_closed_frames = 0
+        if is_door_open == self.is_open:
+            self.state_change_time = None
         else:
-            self.consecutive_closed_frames += 1
-            self.consecutive_open_frames = 0
-
-        if self.consecutive_open_frames >= self.hysteresis_threshold and not self.is_open:
-            self.is_open = True
-            self.opened_at = now
-            self.alert_dispatched = False
-
-        elif self.consecutive_closed_frames >= self.hysteresis_threshold and self.is_open:
-            self.is_open = False
-            self.opened_at = None
-            self.alert_dispatched = False
+            if self.state_change_time is None:
+                self.state_change_time = now
+            elif (now - self.state_change_time) >= self.hysteresis_sec:
+                self.is_open = is_door_open
+                self.state_change_time = None
+                self.opened_at = now if self.is_open else None
+                self.alert_dispatched = False
 
         if self.is_open and self.opened_at:
             duration = now - self.opened_at
