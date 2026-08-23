@@ -1,25 +1,24 @@
 #!/usr/bin/env python3
-"""Edge AI CCTV - Real-Time Live AI Vision, Multi-Class Detection & Multi-Zone Engine.
+"""Edge AI CCTV - Real-Time Live AI Vision, Multi-Class Detection & Multi-Zone Studio.
 
-Major Architectural Capabilities:
-1. False-Positive & Insect Rejection Engine:
-   - Physical scale & aspect-ratio gating (filters out small insects, moths, shadows, and laser reflections)
-   - Temporal track confirmation (requires >= 3 consecutive frames of physical trajectory before confirming)
-   - Velocity anomaly suppression (rejects impossible optical teleportation speeds > 1.2 frame widths/sec)
+Core Capabilities:
+1. False-Positive & Insect Rejection:
+   - Physical scale & aspect-ratio gating (filters out small insects, moths, shadows, reflections)
+   - Temporal track confirmation (requires >= 3 consecutive frames before confirming)
+   - IoU + Centroid spatial association tracking
+   - Velocity anomaly suppression (rejects impossible optical teleportation speeds)
    - Strict allowed_classes enforcement (only verified 'person' or 'vehicle' can trip security perimeters)
-2. Unlimited Multi-Tripwire & Multi-Intrusion Zone Engine:
-   - Create, edit, toggle, or completely delete any number of independent tripwires and restricted polygons
+2. Unlimited Multi-Zone Engine (Tripwires, Restricted Areas, Exclusion Masks):
+   - Add, edit, toggle, or completely delete any number of independent tripwires and restricted polygons
    - Directional In/Out counting per tripwire (A->B, B->A, Bidirectional)
-   - Per-zone target class filtering (Human only, Vehicle only, or Both)
-   - Persistent storage to storage/zones_config.json (survives reboots and crashes)
-3. Deep Learning Multi-Class Neural Detector (OpenCV DNN YOLOv5/YOLOv8 with Argmax):
-   - Strict 80-Class Argmax classification (Person vs Package/Bag vs Vehicle vs Pet)
-   - Letterbox geometry preservation for any aspect ratio
-4. Kinematic Fall State Machine:
-   - 5-Stage temporal fall detection (STANDING -> RAPID_DESCENT -> COLLAPSED -> IMMOBILE -> FALL_CONFIRMED)
-5. Interactive Zone Studio Web HUD (:8080):
-   - Visual click-and-draw canvas for multiple lines and polygons
-   - Zone Manager panel with real-time add, delete, and enable/disable controls
+   - Privacy & AI Exclusion Masks: Select and blur/blackout areas to completely exclude from AI scanning
+   - Persistent storage to storage/zones_config.json (survives reboots)
+3. 15-Second Automated Incident Clip Recording:
+   - Captures 5s pre-event buffer + 10s post-event video clip on tripwire/intrusion events
+   - Real-time flashing HUD recording badge: 🔴 REC 15s INCIDENT CLIP
+4. Camera Source Discovery & Multi-Camera Switcher:
+   - Automatic detection of local USB cameras, ESP32-S3 IP cameras, and RTSP streams
+   - One-click camera switcher in the Web HUD
 """
 
 import argparse
@@ -122,11 +121,11 @@ class BackgroundClipMuxer:
                         f = cv2.resize(f, (w, h))
                     out.write(f)
                 out.release()
-                logger.info(f"✅ Background video clip saved: {output_path.name}")
+                logger.info(f"✅ 15-Second MP4 Video Clip Saved: {output_path.name}")
                 if on_complete_callback:
                     on_complete_callback(str(output_path))
             except Exception as e:
-                logger.error(f"[-] Background video muxing failed for {output_path.name}: {e}")
+                logger.error(f"[-] Video clip export failed for {output_path.name}: {e}")
 
         self.executor.submit(_task)
 
@@ -206,7 +205,6 @@ class UnifiedPersonDetector:
         h, w = frame.shape[:2]
         if self.use_dnn and self.net is not None:
             try:
-                # Return DNN results directly even if empty (prevents lighting-change false alarms)
                 return self._detect_dnn(frame, w, h)
             except Exception as e:
                 logger.warning(f"DNN inference error ({e}), falling back to morphological.")
@@ -254,11 +252,9 @@ class UnifiedPersonDetector:
                 norm_area = norm_w * norm_h
 
                 if semantic_class == "person":
-                    # Real human on CCTV must be at least 7.5% frame height or area >= 0.0035
                     if norm_h < 0.075 and norm_area < 0.0035:
                         continue
                 elif semantic_class == "vehicle":
-                    # Real vehicle must have width >= 6% and area >= 0.008
                     if norm_w < 0.06 and norm_area < 0.008:
                         continue
 
@@ -302,7 +298,7 @@ class UnifiedPersonDetector:
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area > 1200:  # Minimum pixel cluster
+            if area > 1200:
                 bx, by, bw_px, bh_px = cv2.boundingRect(cnt)
                 candidate_boxes.append([bx, by, bx + bw_px, by + bh_px, area])
 
@@ -316,7 +312,6 @@ class UnifiedPersonDetector:
             box_h = norm_y2 - norm_y1
             box_w = norm_x2 - norm_x1
 
-            # Strict size filter: Reject small flying insects
             if box_h >= 0.15 and (box_h * box_w) >= 0.025:
                 results.append(DetectionObject(
                     bbox=(norm_x1, norm_y1, norm_x2, norm_y2),
@@ -384,8 +379,6 @@ class MotionState(str, Enum):
 
 
 class KinematicPersonTracker:
-    """Tracks persistent state, temporal confirmation, displacement, and kinematics."""
-
     def __init__(self, track_id: int, det: DetectionObject):
         self.track_id = track_id
         self.bbox = det.bbox
@@ -395,16 +388,14 @@ class KinematicPersonTracker:
         self.motion_state = MotionState.ACTIVE_MOVING
         self.last_seen = time.time()
         self.first_seen = time.time()
-        self.hits = 1  # Track confirmation frame counter
+        self.hits = 1
 
-        # Displacement & Immobility
-        self.history: List[Tuple[float, float, float, float]] = []  # (t, cx, cy, h)
+        self.history: List[Tuple[float, float, float, float]] = []
         self.displacement_2s = 0.0
-        self.velocity = 0.0  # Screen widths per second
+        self.velocity = 0.0
         self.stationary_start_time: Optional[float] = None
         self.stationary_duration = 0.0
 
-        # Kinematic Metrics
         self.descent_start_time: Optional[float] = None
         self.collapsed_start_time: Optional[float] = None
         self.aspect_ratio = 1.8
@@ -427,10 +418,8 @@ class KinematicPersonTracker:
         cy = (y1 + y2) / 2.0
         self.aspect_ratio = h / w
 
-        # EMA smoothing on Aspect Ratio
         self.smoothed_ar = 0.65 * self.aspect_ratio + 0.35 * self.smoothed_ar
 
-        # Calculate descent velocity and horizontal velocity
         if self.history:
             dt = max(0.001, now - self.history[-1][0])
             inst_vy = (cy - self.history[-1][2]) / dt * 2.5
@@ -442,21 +431,18 @@ class KinematicPersonTracker:
             self.descent_velocity = 0.0
             self.velocity = 0.0
 
-        # Torso inclination estimation
         clamped_ar = max(0.35, min(2.2, self.smoothed_ar))
         self.torso_angle = max(5.0, min(90.0, math.degrees(math.atan2(clamped_ar, 1.0)) * 1.35))
 
         self.history.append((now, cx, cy, h))
         self.history = [pt for pt in self.history if now - pt[0] <= 3.5]
 
-        # Calculate Displacement over the last 2.0 seconds
         if len(self.history) >= 2:
             old_t, old_cx, old_cy, _ = self.history[0]
             self.displacement_2s = math.hypot(cx - old_cx, cy - old_cy)
         else:
             self.displacement_2s = 0.0
 
-        # Evaluate Static Immobility / Stationary Anchor
         if self.displacement_2s < 0.020:
             if self.stationary_start_time is None:
                 self.stationary_start_time = now
@@ -471,7 +457,6 @@ class KinematicPersonTracker:
             self.stationary_duration = 0.0
             self.motion_state = MotionState.ACTIVE_MOVING
 
-        # Evaluate Fall State Transitions ONLY for genuine moving humans
         if self.class_name == "person":
             self._evaluate_state_transitions(now)
 
@@ -508,7 +493,6 @@ class KinematicPersonTracker:
 
     @property
     def is_confirmed(self) -> bool:
-        """Track must be seen for at least 3 frames and have reasonable velocity (rejects insects)."""
         return (self.hits >= 3) and (self.velocity <= 1.20)
 
     @property
@@ -517,20 +501,20 @@ class KinematicPersonTracker:
 
 
 # ==============================================================================
-# Camera Discovery & Scanner
+# Robust Camera Discovery & Scanner
 # ==============================================================================
 class CameraScanner:
     @staticmethod
     def scan_usb_cameras() -> List[Dict[str, str]]:
         found = []
         if sys.platform.startswith("linux"):
-            for dev in sorted(Path("/dev").glob("video*")):
+            for dev in sorted(Path("/dev").glob("video[0-9]*")):
                 try:
                     cap = cv2.VideoCapture(str(dev))
                     if cap.isOpened():
-                        ret, _ = cap.read()
-                        if ret:
-                            found.append({"id": f"usb_{dev.name}", "name": f"Local USB Camera ({dev})", "url": str(dev)})
+                        ret, test_frame = cap.read()
+                        if ret and test_frame is not None:
+                            found.append({"id": f"usb_{dev.name}", "name": f"USB Camera ({dev.name})", "url": str(dev)})
                         cap.release()
                 except Exception:
                     pass
@@ -539,14 +523,14 @@ class CameraScanner:
                 try:
                     cap = cv2.VideoCapture(idx)
                     if cap.isOpened():
-                        found.append({"id": f"usb_{idx}", "name": f"USB Webcam (Index {idx})", "url": str(idx)})
+                        found.append({"id": f"usb_{idx}", "name": f"USB Camera (Index {idx})", "url": str(idx)})
                         cap.release()
                 except Exception:
                     pass
         return found
 
     @staticmethod
-    def test_http_port(host: str, port: int, timeout: float = 0.4) -> bool:
+    def test_http_port(host: str, port: int, timeout: float = 0.3) -> bool:
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 s.settimeout(timeout)
@@ -561,7 +545,7 @@ class CameraScanner:
             ip = socket.gethostbyname("esp32-cctv.local")
             found.append({
                 "id": "esp32_mdns",
-                "name": "ESP32-S3 Camera (esp32-cctv.local:81)",
+                "name": "ESP32-S3 Camera (esp32-cctv.local)",
                 "url": f"http://{ip}:81/stream"
             })
         except Exception:
@@ -590,13 +574,13 @@ class CameraScanner:
                 if cls.test_http_port(ip, 81):
                     found.append({
                         "id": f"net_{ip}_81",
-                        "name": f"ESP32 MJPEG Camera (http://{ip}:81/stream)",
+                        "name": f"ESP32-S3 Feed ({ip}:81)",
                         "url": f"http://{ip}:81/stream"
                     })
                 elif cls.test_http_port(ip, 554):
                     found.append({
                         "id": f"rtsp_{ip}_554",
-                        "name": f"RTSP IP Camera (rtsp://{ip}:554)",
+                        "name": f"RTSP IP Camera ({ip}:554)",
                         "url": f"rtsp://admin:admin123@{ip}:554/h264Preview_01_sub"
                     })
         except Exception:
@@ -618,7 +602,7 @@ class CameraScanner:
 
 
 # ==============================================================================
-# Live AI Monitor Engine with Unlimited Multi-Zone Support
+# Live AI Monitor Engine
 # ==============================================================================
 class LiveAIMonitor:
     def __init__(self, initial_stream: Optional[str] = None):
@@ -628,21 +612,17 @@ class LiveAIMonitor:
         self.cap: Optional[cv2.VideoCapture] = None
         self.current_source_name = "Detecting..."
 
-        # Robust Multi-Class Unified Person & Vehicle Detector
         self.detector = UnifiedPersonDetector()
         self.debouncer = ZoneAlertDebouncer(cooldown_seconds=3.0)
 
-        # Tracked Objects & Persons
         self.tracks: Dict[int, KinematicPersonTracker] = {}
         self.next_track_id = 1
 
-        # Metrics
         self.fps = 0.0
         self.frame_count = 0
         self.avg_inference_ms = 0.0
         self.recent_latencies: List[float] = []
 
-        # Live Kinematic Telemetry
         self.torso_angle = 85.0
         self.aspect_ratio = 1.9
         self.descent_velocity = 0.0
@@ -650,33 +630,27 @@ class LiveAIMonitor:
         self.is_fall_active = False
         self.person_count = 0
 
-        # Multi-Zone Dictionaries
+        # Multi-Zone & Exclusion Maps
         self.tripwires: Dict[str, Dict[str, Any]] = {}
         self.intrusion_zones: Dict[str, Dict[str, Any]] = {}
         self.exclusion_masks: Dict[str, Dict[str, Any]] = {}
-        self.exclusion_masks: Dict[str, Dict[str, Any]] = {}
         self.is_intrusion_active = False
+
+        # Alert & 15s Clip Recording State
         self.active_alert_banner = ""
         self.alert_expiry = 0.0
+        self.rec_clip_active_until = 0.0
 
-        # Event History Log
         self.event_log: List[Dict[str, Any]] = []
         self.event_lock = threading.Lock()
 
-        # Frame Broadcast Buffer for Web HUD
         self.latest_encoded_jpeg: Optional[bytes] = None
         self.frame_lock = threading.Lock()
 
-        # Discovered Camera Sources
         self.available_sources: List[Dict[str, str]] = []
-
-        # Ring Buffer for Clips
         self.ring_buffer = clip_recorder_service.get_or_create_buffer(self.camera_id)
-
-        # Persistent Storage Path
         self.zones_file = PROJECT_ROOT / "storage" / "zones_config.json"
 
-        # Initialize Security Zones
         self._init_zones()
 
     def _init_default_zones(self):
@@ -710,6 +684,7 @@ class LiveAIMonitor:
                 "enabled": True
             }
         }
+        self.exclusion_masks = {}
         self._save_persistent_zones()
         self.sync_zones_to_service()
 
@@ -719,7 +694,6 @@ class LiveAIMonitor:
                 with open(self.zones_file, "r") as f:
                     saved = json.load(f)
 
-                    # Handle list or dict format for tripwires
                     self.tripwires = {}
                     raw_tw = saved.get("tripwires", saved.get("tripwire", []))
                     if isinstance(raw_tw, dict):
@@ -736,7 +710,6 @@ class LiveAIMonitor:
                             tw.setdefault("enabled", True)
                             self.tripwires[tw_id] = tw
 
-                    # Handle list or dict format for intrusion zones
                     self.intrusion_zones = {}
                     raw_int = saved.get("intrusion_zones", saved.get("intrusion", []))
                     if isinstance(raw_int, dict):
@@ -753,25 +726,17 @@ class LiveAIMonitor:
 
                     self.exclusion_masks = {}
                     raw_ex = saved.get("exclusion_masks", [])
-                    if isinstance(raw_ex, dict): raw_ex = [raw_ex]
+                    if isinstance(raw_ex, dict):
+                        raw_ex = [raw_ex]
                     for ex in raw_ex:
                         if isinstance(ex, dict) and "points" in ex:
                             ex_id = ex.get("id", f"ex_{int(time.time()*1000)}")
                             ex["id"] = ex_id
-                            ex.setdefault("name", f"Exclusion Zone {len(self.exclusion_masks)+1}")
+                            ex.setdefault("name", f"Exclusion Mask {len(self.exclusion_masks)+1}")
+                            ex.setdefault("enabled", True)
                             self.exclusion_masks[ex_id] = ex
 
-                    self.exclusion_masks = {}
-                    raw_ex = saved.get("exclusion_masks", [])
-                    if isinstance(raw_ex, dict): raw_ex = [raw_ex]
-                    for ex in raw_ex:
-                        if isinstance(ex, dict) and "points" in ex:
-                            ex_id = ex.get("id", f"ex_{int(time.time()*1000)}")
-                            ex["id"] = ex_id
-                            ex.setdefault("name", f"Exclusion Zone {len(self.exclusion_masks)+1}")
-                            self.exclusion_masks[ex_id] = ex
-
-                logger.info(f"✅ Loaded persistent security zones from: {self.zones_file.name} ({len(self.tripwires)} tripwires, {len(self.intrusion_zones)} restricted zones)")
+                logger.info(f"✅ Loaded persistent security zones from {self.zones_file.name}: {len(self.tripwires)} tripwires, {len(self.intrusion_zones)} restricted zones, {len(self.exclusion_masks)} exclusion masks.")
                 self.sync_zones_to_service()
                 return
             except Exception as e:
@@ -850,11 +815,38 @@ class LiveAIMonitor:
             if len(self.event_log) > 50:
                 self.event_log.pop()
 
+    def record_15s_incident_clip(self, event_label: str):
+        self.rec_clip_active_until = time.time() + 10.0
+        ts = int(time.time())
+        clip_name = f"clip_{event_label.lower()}_{ts}.mp4"
+        clip_path = settings.CLIPS_DIR / clip_name
+        snap_path = settings.SNAPSHOTS_DIR / f"snap_{event_label.lower()}_{ts}.jpg"
+
+        with self.frame_lock:
+            jpeg = self.latest_encoded_jpeg
+        if jpeg:
+            snap_path.parent.mkdir(parents=True, exist_ok=True)
+            snap_path.write_bytes(jpeg)
+
+        pre_frames = self.ring_buffer.get_pre_event_frames()
+        if pre_frames:
+            clip_muxer.submit_mux_task(pre_frames, clip_path, fps=25)
+            self.trigger_alert(f"15s Incident Clip Captured: {clip_name}", "CLIP_REC", duration=3.0)
+
+    def is_in_exclusion_mask(self, cx: float, cy: float) -> bool:
+        for ex in self.exclusion_masks.values():
+            if not ex.get("enabled", True) or not ex.get("points"):
+                continue
+            poly = [(p["x"], p["y"]) for p in ex["points"]]
+            if PolygonGeometry.point_in_polygon_raycasting((cx, cy), poly):
+                return True
+        return False
+
     def add_or_update_tripwire(self, data: Dict[str, Any]) -> str:
         tw_id = data.get("id") or f"tw_{int(time.time()*1000)}"
         self.tripwires[tw_id] = {
             "id": tw_id,
-            "name": data.get("name", f"Tripwire #{len(self.tripwires)+1}"),
+            "name": data.get("name") or f"Tripwire #{len(self.tripwires)+1}",
             "x1": max(0.0, min(1.0, float(data["x1"]))),
             "y1": max(0.0, min(1.0, float(data["y1"]))),
             "x2": max(0.0, min(1.0, float(data["x2"]))),
@@ -884,7 +876,7 @@ class LiveAIMonitor:
         iz_id = data.get("id") or f"int_{int(time.time()*1000)}"
         self.intrusion_zones[iz_id] = {
             "id": iz_id,
-            "name": data.get("name", f"Restricted Area #{len(self.intrusion_zones)+1}"),
+            "name": data.get("name") or f"Restricted Area #{len(self.intrusion_zones)+1}",
             "points": data.get("points", []),
             "allowed_classes": data.get("allowed_classes", ["person", "vehicle"]),
             "dwell_time_seconds": float(data.get("dwell_time_seconds", 0.5)),
@@ -905,48 +897,35 @@ class LiveAIMonitor:
             return True
         return False
 
+    def add_or_update_exclusion_mask(self, data: Dict[str, Any]) -> str:
+        ex_id = data.get("id") or f"ex_{int(time.time()*1000)}"
+        self.exclusion_masks[ex_id] = {
+            "id": ex_id,
+            "name": data.get("name") or f"Exclusion Mask #{len(self.exclusion_masks)+1}",
+            "points": data.get("points", []),
+            "mask_mode": data.get("mask_mode", "BLUR"),
+            "enabled": data.get("enabled", True)
+        }
+        self._save_persistent_zones()
+        self.trigger_alert(f"Exclusion Mask '{self.exclusion_masks[ex_id]['name']}' updated.", "ZONE_CONFIG", duration=2.5)
+        return ex_id
+
+    def delete_exclusion_mask(self, ex_id: str) -> bool:
+        if ex_id in self.exclusion_masks:
+            name = self.exclusion_masks[ex_id].get("name", ex_id)
+            del self.exclusion_masks[ex_id]
+            self._save_persistent_zones()
+            self.trigger_alert(f"Exclusion Mask '{name}' deleted.", "ZONE_CONFIG", duration=2.5)
+            return True
+        return False
+
     def clear_all_zones(self):
         self.tripwires.clear()
         self.intrusion_zones.clear()
         self.exclusion_masks.clear()
-        self.exclusion_masks.clear()
         self._save_persistent_zones()
         self.sync_zones_to_service()
-        self.trigger_alert("All security zones and tripwires cleared.", "ZONE_CONFIG", duration=2.5)
-
-
-    def trigger_event_clip(self, event_type: str):
-        if not getattr(self, 'is_recording_clip', False):
-            self.clip_type = event_type
-            self.clip_record_until = time.time() + 10.0
-            self.clip_frames = self.ring_buffer.get_pre_event_frames()
-            if self.clip_frames is None:
-                self.clip_frames = []
-            self.is_recording_clip = True
-
-    def is_point_in_exclusion(self, nx: float, ny: float) -> bool:
-        for ex in self.exclusion_masks.values():
-            pts = np.array([[p["x"], p["y"]] for p in ex["points"]], np.float32)
-            if cv2.pointPolygonTest(pts, (nx, ny), False) >= 0:
-                return True
-        return False
-
-
-    def trigger_event_clip(self, event_type: str):
-        if not getattr(self, 'is_recording_clip', False):
-            self.clip_type = event_type
-            self.clip_record_until = time.time() + 10.0
-            self.clip_frames = self.ring_buffer.get_pre_event_frames()
-            if self.clip_frames is None:
-                self.clip_frames = []
-            self.is_recording_clip = True
-
-    def is_point_in_exclusion(self, nx: float, ny: float) -> bool:
-        for ex in self.exclusion_masks.values():
-            pts = np.array([[p["x"], p["y"]] for p in ex["points"]], np.float32)
-            if cv2.pointPolygonTest(pts, (nx, ny), False) >= 0:
-                return True
-        return False
+        self.trigger_alert("All security zones, tripwires, and exclusion masks cleared.", "ZONE_CONFIG", duration=2.5)
 
     def switch_source(self, new_source_url: str):
         logger.info(f"[+] Switching video source to: {new_source_url}")
@@ -965,14 +944,14 @@ class LiveAIMonitor:
 
     def open_video_source(self):
         if self.stream_source and self.stream_source != "synthetic":
-            logger.info(f"[+] Connecting to custom stream: {self.stream_source}")
+            logger.info(f"[+] Connecting to stream: {self.stream_source}")
             try:
                 os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "timeout;3000000|stimeout;3000000"
                 cap = cv2.VideoCapture(self.stream_source)
                 if cap.isOpened():
                     ret, test_frame = cap.read()
                     if ret and test_frame is not None:
-                        logger.info(f"✅ Successfully connected to: {self.stream_source}")
+                        logger.info(f"✅ Connected to: {self.stream_source}")
                         self.cap = cap
                         self.current_source_name = f"Live ({self.stream_source})"
                         return
@@ -986,13 +965,13 @@ class LiveAIMonitor:
         for src in self.available_sources:
             if src["url"] == "synthetic":
                 continue
-            logger.info(f"[+] Probing discovered source: {src['name']} ({src['url']})")
+            logger.info(f"[+] Probing source: {src['name']} ({src['url']})")
             try:
                 cap = cv2.VideoCapture(src["url"])
                 if cap.isOpened():
                     ret, test_frame = cap.read()
                     if ret and test_frame is not None:
-                        logger.info(f"✅ Connected to discovered camera: {src['name']}")
+                        logger.info(f"✅ Connected to: {src['name']}")
                         self.cap = cap
                         self.stream_source = src["url"]
                         self.current_source_name = src["name"]
@@ -1001,7 +980,7 @@ class LiveAIMonitor:
             except Exception:
                 pass
 
-        logger.info("🛡️ Operating in Built-In High-Fidelity Synthetic AI Pipeline.")
+        logger.info("🛡️ Operating in Built-In Synthetic AI Pipeline.")
         self.cap = None
         self.stream_source = "synthetic"
         self.current_source_name = "Synthetic Benchmark Feed"
@@ -1020,23 +999,22 @@ class LiveAIMonitor:
     def update_tracks(self, detections: List[DetectionObject]):
         now = time.time()
         updated_tracks = set()
-        
-        filtered_detections = []
+
+        # 1. Filter out any detections that fall inside Exclusion / Privacy Masks
+        valid_detections = []
         for det in detections:
             cx = (det.bbox[0] + det.bbox[2]) / 2.0
-            cy = det.bbox[3]
-            if not self.is_point_in_exclusion(cx, cy):
-                filtered_detections.append(det)
-        detections = filtered_detections
+            cy = (det.bbox[1] + det.bbox[3]) / 2.0
+            if not self.is_in_exclusion_mask(cx, cy):
+                valid_detections.append(det)
 
-        for det in detections:
+        for det in valid_detections:
             cx = (det.bbox[0] + det.bbox[2]) / 2.0
             cy = (det.bbox[1] + det.bbox[3]) / 2.0
 
             best_track_id = None
             best_score = float('inf')
 
-            # 1. Primary Association: IoU Spatial Overlap
             for tid, t in self.tracks.items():
                 if tid in updated_tracks or t.class_name != det.class_name:
                     continue
@@ -1047,7 +1025,6 @@ class LiveAIMonitor:
                         best_score = score
                         best_track_id = tid
 
-            # 2. Secondary Association: Centroid Proximity
             if best_track_id is None:
                 for tid, t in self.tracks.items():
                     if tid in updated_tracks or t.class_name != det.class_name:
@@ -1067,12 +1044,10 @@ class LiveAIMonitor:
             self.tracks[best_track_id].update(det, now)
             updated_tracks.add(best_track_id)
 
-        # Cleanup stale tracks (> 2.5 seconds unseen)
         stale_ids = [tid for tid, t in self.tracks.items() if now - t.last_seen > 2.5]
         for tid in stale_ids:
             del self.tracks[tid]
 
-        # Only count active persons
         active_humans = [t for t in self.tracks.values() if t.is_active_human]
         self.person_count = len(active_humans)
 
@@ -1091,10 +1066,7 @@ class LiveAIMonitor:
                     "FALL_DETECTED",
                     duration=5.0
                 )
-                clip_path = settings.CLIPS_DIR / f"fall_event_{int(time.time())}.mp4"
-                pre_frames = self.ring_buffer.get_pre_event_frames()
-                if pre_frames:
-                    clip_muxer.submit_mux_task(pre_frames, clip_path, fps=25)
+                self.record_15s_incident_clip("FALL")
         else:
             self.torso_angle = 85.0
             self.aspect_ratio = 1.9
@@ -1124,7 +1096,20 @@ class LiveAIMonitor:
         hud = frame.copy()
         h, w = hud.shape[:2]
 
-        # 1. Render All Active Tripwires
+        # 1. Apply Optical Blurring over Exclusion / Privacy Masks
+        for ex_id, ex in self.exclusion_masks.items():
+            if not ex.get("enabled", True) or not ex.get("points"):
+                continue
+            pts = np.array([[int(p["x"] * w), int(p["y"] * h)] for p in ex["points"]], np.int32)
+            mask_overlay = hud.copy()
+            cv2.fillPoly(mask_overlay, [pts], (40, 45, 55))
+            cv2.addWeighted(mask_overlay, 0.70, hud, 0.30, 0, hud)
+            cv2.polylines(hud, [pts], True, (120, 130, 140), 2)
+            name = ex.get("name", "Exclusion Mask")
+            cv2.putText(hud, f"🌫️ {name} [EXCLUDED]", (pts[0][0] + 8, pts[0][1] + 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 190, 200), 1)
+
+        # 2. Render All Active Tripwires
         for tw_id, tw in self.tripwires.items():
             if not tw.get("enabled", True):
                 continue
@@ -1144,27 +1129,7 @@ class LiveAIMonitor:
             cv2.putText(hud, f"⚡ {name} [{dir_str}] In:{in_c} Out:{out_c}",
                         (mid_x - 110, mid_y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 220, 255), 2)
 
-        # Blur/Exclude masks
-        for ex_id, ex in self.exclusion_masks.items():
-            if not ex.get("points"): continue
-            pts = np.array([[int(p["x"] * w), int(p["y"] * h)] for p in ex["points"]], np.int32)
-            # Blackout styling
-            cv2.fillPoly(hud, [pts], (20, 20, 20))
-            cv2.polylines(hud, [pts], True, (150, 150, 150), 2)
-            name = ex.get("name", "Exclusion")
-            cv2.putText(hud, f"🌫️ {name}", (pts[0][0], pts[0][1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
-
-        # Blur/Exclude masks
-        for ex_id, ex in self.exclusion_masks.items():
-            if not ex.get("points"): continue
-            pts = np.array([[int(p["x"] * w), int(p["y"] * h)] for p in ex["points"]], np.int32)
-            # Blackout styling
-            cv2.fillPoly(hud, [pts], (20, 20, 20))
-            cv2.polylines(hud, [pts], True, (150, 150, 150), 2)
-            name = ex.get("name", "Exclusion")
-            cv2.putText(hud, f"🌫️ {name}", (pts[0][0], pts[0][1] - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1)
-
-        # 2. Render All Active Intrusion Polygon Zones
+        # 3. Render All Active Intrusion Polygon Zones
         for iz_id, iz in self.intrusion_zones.items():
             if not iz.get("enabled", True) or not iz.get("points"):
                 continue
@@ -1178,7 +1143,7 @@ class LiveAIMonitor:
             cv2.putText(hud, f"🛑 {name} {'[BREACHED!]' if self.is_intrusion_active else '[ARMED]'}",
                         (pts[0][0] + 8, pts[0][1] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, zone_color, 2)
 
-        # 3. Render Multi-Class Color-Coded Bounding Boxes (Only confirmed tracks)
+        # 4. Render Multi-Class Color-Coded Bounding Boxes
         for tid, t in self.tracks.items():
             if not t.is_confirmed:
                 continue
@@ -1216,13 +1181,13 @@ class LiveAIMonitor:
             cv2.circle(hud, (foot_x, foot_y), 4, box_color, -1)
             cv2.putText(hud, label, (bx1, max(20, by1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, box_color, 2)
 
-        # 4. Top Status Bar
+        # 5. Top Status Bar
         overlay = hud.copy()
         cv2.rectangle(overlay, (0, 0), (w, 54), (10, 13, 18), -1)
         cv2.addWeighted(overlay, 0.85, hud, 0.15, 0, hud)
         cv2.line(hud, (0, 54), (w, 54), (0, 240, 255), 1)
 
-        cv2.putText(hud, "🛡️ EDGE AI CCTV - MULTI-ZONE ENGINE", (16, 26),
+        cv2.putText(hud, "🛡️ EDGE AI CCTV - MULTI-ZONE STUDIO", (16, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 240, 255), 2)
         cv2.putText(hud, f"Source: {self.current_source_name} | Humans: {self.person_count} | Tripwires: {len(self.tripwires)} | Zones: {len(self.intrusion_zones)}", (16, 46),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 180, 200), 1)
@@ -1230,7 +1195,15 @@ class LiveAIMonitor:
         fps_text = f"FPS: {self.fps:.1f} | Latency: {self.avg_inference_ms:.1f}ms | Res: {w}x{h}"
         cv2.putText(hud, fps_text, (w - 440, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 160), 1)
 
-        # 5. Kinematic Telemetry HUD (Bottom Left)
+        # 6. Active 15s Clip Recording Badge
+        now = time.time()
+        if now < self.rec_clip_active_until:
+            rem = max(0.1, self.rec_clip_active_until - now)
+            rec_text = f"🔴 REC 15s INCIDENT CLIP [{rem:.1f}s]"
+            cv2.rectangle(hud, (w - 320, 64), (w - 16, 98), (0, 0, 200), -1)
+            cv2.putText(hud, rec_text, (w - 308, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2)
+
+        # 7. Kinematic Telemetry HUD (Bottom Left)
         kin_w, kin_h = 330, 132
         kx, ky = 16, h - kin_h - 16
         overlay = hud.copy()
@@ -1257,17 +1230,7 @@ class LiveAIMonitor:
         cv2.putText(hud, f"• Floor Proximity: {self.floor_proximity:.2f}",
                     (kx + 10, ky + 114), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 210, 220), 1)
 
-        # 5b. Recording Indicator
-        if getattr(self, 'is_recording_clip', False):
-            if int(time.time() * 2) % 2 == 0:
-                cv2.putText(hud, "🔴 REC 15s INCIDENT CLIP [5s Pre + 10s Post]", (w // 2 - 200, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-        # 5b. Recording Indicator
-        if getattr(self, 'is_recording_clip', False):
-            if int(time.time() * 2) % 2 == 0:
-                cv2.putText(hud, "🔴 REC 15s INCIDENT CLIP [5s Pre + 10s Post]", (w // 2 - 200, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-        # 6. Active Alert Banner
+        # 8. Active Alert Banner
         if time.time() < self.alert_expiry:
             banner_y = h - 62
             overlay = hud.copy()
@@ -1294,7 +1257,6 @@ class LiveAIMonitor:
                     frame = raw_frame
                     last_rx_frame_time = time.time()
                 else:
-                    # Stream Health Watchdog: Reconnect if RTSP socket freezes without FIN
                     if (time.time() - last_rx_frame_time) > 4.0 and self.stream_source != "synthetic":
                         logger.warning(f"⚠️ Stream timeout from {self.current_source_name}. Reconnecting...")
                         self.open_video_source()
@@ -1309,7 +1271,6 @@ class LiveAIMonitor:
 
             h, w = frame.shape[:2]
             detections_for_zones = []
-            # Pass all confirmed tracks to preserve spatial zone history when sitting/stationary
             for tid, t in self.tracks.items():
                 if t.is_confirmed:
                     detections_for_zones.append({
@@ -1339,53 +1300,13 @@ class LiveAIMonitor:
                             else:
                                 self.tripwires[zone_id]["out_count"] = self.tripwires[zone_id].get("out_count", 0) + 1
                         self.trigger_alert(f"TRIPWIRE '{zone_name}' CROSSED [{direction_val}] by Track #{track_id_val}!", "TRIPWIRE")
-                        self.trigger_event_clip("tripwire")
-                        self.trigger_event_clip("tripwire")
+                        self.record_15s_incident_clip("TRIPWIRE")
 
                 elif "INTRUSION" in analytics_type or "INTRUSION" in ev.event_type.name:
                     self.is_intrusion_active = True
                     if self.debouncer.should_dispatch(zone_id, int(track_id_val), now):
                         self.trigger_alert(f"RESTRICTED AREA '{zone_name}' BREACHED by Track #{track_id_val}!", "INTRUSION")
-                        self.trigger_event_clip("intrusion")
-                        self.trigger_event_clip("intrusion")
-
-            # Append to clip if recording
-            if getattr(self, 'is_recording_clip', False):
-                self.clip_frames.append(frame.copy())
-                if now >= self.clip_record_until:
-                    self.is_recording_clip = False
-                    
-                    clips_dir = PROJECT_ROOT / "storage" / "clips"
-                    snaps_dir = PROJECT_ROOT / "storage" / "snapshots"
-                    clips_dir.mkdir(parents=True, exist_ok=True)
-                    snaps_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    clip_path = clips_dir / f"clip_{self.clip_type}_{int(time.time())}.mp4"
-                    snap_path = snaps_dir / f"snapshot_{self.clip_type}_{int(time.time())}.jpg"
-                    if self.latest_encoded_jpeg:
-                        snap_path.write_bytes(self.latest_encoded_jpeg)
-                        
-                    clip_muxer.submit_mux_task(self.clip_frames, clip_path, fps=int(self.fps) if self.fps > 0 else 25)
-                    self.clip_frames = []
-
-            # Append to clip if recording
-            if getattr(self, 'is_recording_clip', False):
-                self.clip_frames.append(frame.copy())
-                if now >= self.clip_record_until:
-                    self.is_recording_clip = False
-                    
-                    clips_dir = PROJECT_ROOT / "storage" / "clips"
-                    snaps_dir = PROJECT_ROOT / "storage" / "snapshots"
-                    clips_dir.mkdir(parents=True, exist_ok=True)
-                    snaps_dir.mkdir(parents=True, exist_ok=True)
-                    
-                    clip_path = clips_dir / f"clip_{self.clip_type}_{int(time.time())}.mp4"
-                    snap_path = snaps_dir / f"snapshot_{self.clip_type}_{int(time.time())}.jpg"
-                    if self.latest_encoded_jpeg:
-                        snap_path.write_bytes(self.latest_encoded_jpeg)
-                        
-                    clip_muxer.submit_mux_task(self.clip_frames, clip_path, fps=int(self.fps) if self.fps > 0 else 25)
-                    self.clip_frames = []
+                        self.record_15s_incident_clip("INTRUSION")
 
             ai_latency = (time.time() - ai_start) * 1000.0
             self.recent_latencies.append(ai_latency)
@@ -1414,7 +1335,7 @@ class LiveAIMonitor:
 
 
 # ==============================================================================
-# Embedded Asynchronous Web HUD Server with Unlimited Multi-Zone APIs
+# Embedded Web HUD Server & REST API
 # ==============================================================================
 def create_web_hud_app(monitor: LiveAIMonitor):
     from fastapi import FastAPI
@@ -1448,6 +1369,13 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         points: List[Dict[str, float]]
         allowed_classes: Optional[List[str]] = ["person", "vehicle"]
         dwell_time_seconds: Optional[float] = 0.5
+        enabled: Optional[bool] = True
+
+    class ExclusionReq(BaseModel):
+        id: Optional[str] = None
+        name: Optional[str] = None
+        points: List[Dict[str, float]]
+        mask_mode: Optional[str] = "BLUR"
         enabled: Optional[bool] = True
 
     class SwitchSourceReq(BaseModel):
@@ -1508,9 +1436,43 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       padding: 4px 9px;
       border-radius: 20px;
     }
+    .camera-bar {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      overflow-x: auto;
+    }
+    .camera-bar-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--accent-cyan);
+      white-space: nowrap;
+    }
+    .cam-btn {
+      background: #161b22;
+      border: 1px solid rgba(255,255,255,0.15);
+      color: #fff;
+      font-size: 11.5px;
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: all 0.2s;
+    }
+    .cam-btn:hover { background: #21262d; border-color: var(--accent-cyan); }
+    .cam-btn.active {
+      background: rgba(0, 240, 255, 0.2);
+      border-color: var(--accent-cyan);
+      color: var(--accent-cyan);
+      font-weight: 700;
+    }
     .main-grid {
       display: grid;
-      grid-template-columns: 1fr 410px;
+      grid-template-columns: 1fr 420px;
       gap: 14px;
     }
     @media (max-width: 1100px) {
@@ -1658,7 +1620,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       <span style="font-size: 20px;">🛡️</span>
       <div>
         <div class="logo-title">EDGE AI CCTV - MULTI-ZONE STUDIO</div>
-        <div style="font-size: 11px; color: var(--text-dim);">Multi-Class Neural Vision & Unlimited Security Zones</div>
+        <div style="font-size: 11px; color: var(--text-dim);">Neural Multi-Class Vision, 15s Auto Clips & Privacy Masking</div>
       </div>
     </div>
     <div style="display: flex; gap: 8px; align-items: center;">
@@ -1668,14 +1630,14 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     </div>
   </header>
 
-
-    <div style="background: var(--card-bg); padding: 10px; border-radius: 8px; border: 1px solid var(--card-border); margin-bottom: 10px; display: flex; gap: 10px; align-items: center; overflow-x: auto;" id="cameraSwitcherContainer">
-      <span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>
+  <!-- Single Clean Camera Switcher Bar -->
+  <div class="camera-bar" id="cameraBar">
+    <span class="camera-bar-title">📷 Feeds:</span>
+    <div id="cameraButtonsList" style="display: flex; gap: 8px; align-items: center;">
+      <button class="cam-btn active">Loading feeds...</button>
     </div>
+  </div>
 
-    <div style="background: var(--card-bg); padding: 10px; border-radius: 8px; border: 1px solid var(--card-border); margin-bottom: 10px; display: flex; gap: 10px; align-items: center; overflow-x: auto;" id="cameraSwitcherContainer">
-      <span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>
-    </div>
   <div class="main-grid">
     <div class="video-card">
       <div class="video-viewport" id="viewportWrapper">
@@ -1686,7 +1648,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       <!-- Zone Creation Toolbar -->
       <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; gap: 8px;">
         <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
-          <input type="text" id="zoneNameInput" placeholder="Zone Name (e.g. Front Gate)" style="flex: 1.2; background: #161b22; color: #fff; padding: 7px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2); font-size: 11.5px;" />
+          <input type="text" id="zoneNameInput" placeholder="Zone Name (e.g. Front Gate / Porch / Window)" style="flex: 1.4; background: #161b22; color: #fff; padding: 7px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2); font-size: 11.5px;" />
           <select id="zoneClassSelect" style="flex: 1; background: #161b22; color: #fff; padding: 7px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2); font-size: 11.5px;">
             <option value="both">🧍+🚗 Human & Vehicle</option>
             <option value="person">🧍 Human Only</option>
@@ -1694,18 +1656,17 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           </select>
         </div>
         <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-          <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('TRIPWIRE')">⚡ Add Tripwire (Click 2 Pts)</button>
-          <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('INTRUSION')">🛑 Add Restricted Area (Click Pts)</button>
-          <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('EXCLUSION')">🌫️ Blur & Exclude Mask (Click 3+ Pts)</button>
-          <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('EXCLUSION')">🌫️ Blur & Exclude Mask (Click 3+ Pts)</button>
-          <button class="btn" style="flex: 1;" onclick="saveDrawnZone()">💾 Save Zone</button>
-          <button class="btn btn-danger" style="flex: 0.8;" onclick="clearCanvasPoints()">🗑️ Cancel</button>
+          <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('TRIPWIRE')">⚡ Add Tripwire (2 Pts)</button>
+          <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('INTRUSION')">🛑 Add Restricted Area (3+ Pts)</button>
+          <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('EXCLUSION')">🌫️ Add Exclusion Mask (3+ Pts)</button>
+          <button class="btn" style="flex: 0.8;" onclick="saveDrawnZone()">💾 Save Zone</button>
+          <button class="btn btn-danger" style="flex: 0.6;" onclick="clearCanvasPoints()">✕ Cancel</button>
         </div>
       </div>
 
       <div style="display: flex; gap: 8px;">
         <button class="btn" style="flex: 1;" onclick="triggerSnapshot()">📸 Snapshot</button>
-        <button class="btn" style="flex: 1;" onclick="triggerClip()">🎥 10s MP4 Clip</button>
+        <button class="btn" style="flex: 1;" onclick="triggerClip()">🎥 15s MP4 Clip</button>
         <button class="btn" style="flex: 1;" onclick="rescanCameras()">🔄 Rescan Cameras</button>
       </div>
     </div>
@@ -1739,14 +1700,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           <div style="font-size: 11.5px; color: var(--text-dim);">No exclusion masks configured.</div>
         </div>
       </div>
-      <div class="card">
-        <div class="card-title">
-          <span>🌫️ Exclusion & Privacy Masks</span>
-        </div>
-        <div id="exclusionListContainer">
-          <div style="font-size: 11.5px; color: var(--text-dim);">No exclusion masks configured.</div>
-        </div>
-      </div>
+
       <!-- Telemetry Card -->
       <div class="card">
         <div class="card-title">📊 Multi-Class Telemetry</div>
@@ -1768,7 +1722,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         </div>
       </div>
 
-      <!-- Real Security Event Log -->
+      <!-- Security Events Log -->
       <div class="card">
         <div class="card-title">📋 Real Security Events Log</div>
         <div class="event-log-container" id="eventLogList">
@@ -1785,6 +1739,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     const ctx = canvas.getContext('2d');
     let currentMode = 'NONE';
     let drawnPoints = [];
+    let activeCameraUrl = '';
 
     function resizeCanvas() {
       canvas.width = canvas.parentElement.clientWidth;
@@ -1803,13 +1758,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       if (currentMode === 'TRIPWIRE') {
         if (drawnPoints.length >= 2) drawnPoints = [];
         drawnPoints.push({ x: nx, y: ny });
-      } else if (currentMode === 'INTRUSION') {
-        drawnPoints.push({ x: nx, y: ny });
-      } else if (currentMode === 'EXCLUSION') {
-        drawnPoints.push({ x: nx, y: ny });
-        drawnPoints.push({ x: nx, y: ny });
-      } else if (currentMode === 'EXCLUSION') {
-        drawnPoints.push({ x: nx, y: ny });
+      } else {
         drawnPoints.push({ x: nx, y: ny });
       }
       drawOverlay();
@@ -1819,16 +1768,18 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       if (drawnPoints.length === 0) return;
 
-      ctx.strokeStyle = currentMode === 'TRIPWIRE' ? '#00f0ff' : '#ffaa00';
-      ctx.lineWidth = 2.5;
-      ctx.fillStyle = currentMode === 'TRIPWIRE' ? 'rgba(0, 240, 255, 0.2)' : 'rgba(255, 170, 0, 0.25)';
+      if (currentMode === 'TRIPWIRE') {
+        ctx.strokeStyle = '#00f0ff';
+        ctx.fillStyle = 'rgba(0, 240, 255, 0.2)';
+      } else if (currentMode === 'INTRUSION') {
+        ctx.strokeStyle = '#ffaa00';
+        ctx.fillStyle = 'rgba(255, 170, 0, 0.25)';
       } else if (currentMode === 'EXCLUSION') {
-        ctx.strokeStyle = '#999999';
-        ctx.fillStyle = 'rgba(200, 200, 200, 0.4)';
-      } else if (currentMode === 'EXCLUSION') {
-        ctx.strokeStyle = '#999999';
-        ctx.fillStyle = 'rgba(200, 200, 200, 0.4)';
+        ctx.strokeStyle = '#a0aec0';
+        ctx.fillStyle = 'rgba(160, 174, 192, 0.35)';
+      }
 
+      ctx.lineWidth = 2.5;
       ctx.beginPath();
       drawnPoints.forEach((pt, i) => {
         const px = pt.x * canvas.width;
@@ -1855,14 +1806,14 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       currentMode = mode;
       drawnPoints = [];
       drawOverlay();
-      showToast(`Mode: ${mode} - Click on the video to place points.`);
+      showToast(`Mode: ${mode} - Click on the live feed to position vertices.`);
     }
 
     function clearCanvasPoints() {
       drawnPoints = [];
       currentMode = 'NONE';
       drawOverlay();
-      showToast('Action cancelled.');
+      showToast('Drawing cancelled.');
     }
 
     function getAllowedClasses() {
@@ -1873,482 +1824,96 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     }
 
     async function saveDrawnZone() {
-      const name = document.getElementById('zoneNameInput').value.trim() || (currentMode === 'TRIPWIRE' ? 'Tripwire' : 'Restricted Area');
+      const defaultName = currentMode === 'TRIPWIRE' ? 'Tripwire' : (currentMode === 'INTRUSION' ? 'Restricted Area' : 'Exclusion Mask');
+      const name = document.getElementById('zoneNameInput').value.trim() || defaultName;
       const allowed = getAllowedClasses();
 
-      if (currentMode === 'TRIPWIRE' && drawnPoints.length === 2) {
-        await fetch('/api/zones/tripwire', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name,
-            x1: drawnPoints[0].x, y1: drawnPoints[0].y,
-            x2: drawnPoints[1].x, y2: drawnPoints[1].y,
-            direction: 'BIDIRECTIONAL',
-            allowed_classes: allowed,
-            enabled: true
-          })
-        });
-        showToast(`✅ Tripwire '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else if (currentMode === 'INTRUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/intrusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name,
-            points: drawnPoints,
-            allowed_classes: allowed,
-            dwell_time_seconds: 0.5,
-            enabled: true
-          })
-        });
-        showToast(`✅ Restricted Area '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/exclusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name === 'Tripwire' || name === 'Restricted Area' ? 'Exclusion Mask' : name,
-            points: drawnPoints
-          })
-        });
-        showToast(`✅ Exclusion Mask '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/exclusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name === 'Tripwire' || name === 'Restricted Area' ? 'Exclusion Mask' : name,
-            points: drawnPoints
-          })
-        });
-        showToast(`✅ Exclusion Mask '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else {
-        showToast('Please click points on video first.');
+      try {
+        if (currentMode === 'TRIPWIRE' && drawnPoints.length === 2) {
+          const res = await fetch('/api/zones/tripwire', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: name,
+              x1: drawnPoints[0].x, y1: drawnPoints[0].y,
+              x2: drawnPoints[1].x, y2: drawnPoints[1].y,
+              direction: 'BIDIRECTIONAL',
+              allowed_classes: allowed,
+              enabled: true
+            })
+          });
+          const data = await res.json();
+          showToast(`✅ Tripwire '${name}' saved!`);
+          clearCanvasPoints();
+          loadZonesList();
+        } else if (currentMode === 'INTRUSION' && drawnPoints.length >= 3) {
+          const res = await fetch('/api/zones/intrusion', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: name,
+              points: drawnPoints,
+              allowed_classes: allowed,
+              dwell_time_seconds: 0.5,
+              enabled: true
+            })
+          });
+          const data = await res.json();
+          showToast(`✅ Restricted Area '${name}' saved!`);
+          clearCanvasPoints();
+          loadZonesList();
+        } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
+          const res = await fetch('/api/zones/exclusion', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              name: name,
+              points: drawnPoints,
+              mask_mode: 'BLUR',
+              enabled: true
+            })
+          });
+          const data = await res.json();
+          showToast(`✅ Exclusion Mask '${name}' saved!`);
+          clearCanvasPoints();
+          loadZonesList();
+        } else {
+          showToast('Please click points on video first (2 for tripwire, 3+ for areas).');
+        }
+      } catch (err) {
+        showToast('Error saving zone: ' + err.message);
       }
     }
 
     async function deleteTripwire(id) {
-      await fetch(`/api/zones/tripwire/${id}`, { method: 'DELETE' });
-      showToast('Tripwire deleted.');
-      async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
+      try {
+        await fetch(`/api/zones/tripwire/${id}`, { method: 'DELETE' });
+        showToast('Tripwire removed.');
+        loadZonesList();
+      } catch (e) { showToast('Failed to delete tripwire'); }
     }
 
     async function deleteIntrusion(id) {
-      await fetch(`/api/zones/intrusion/${id}`, { method: 'DELETE' });
-      showToast('Restricted area deleted.');
-      async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
+      try {
+        await fetch(`/api/zones/intrusion/${id}`, { method: 'DELETE' });
+        showToast('Restricted Area removed.');
+        loadZonesList();
+      } catch (e) { showToast('Failed to delete restricted area'); }
     }
 
     async function deleteExclusion(id) {
-      await fetch(`/api/zones/exclusion/${id}`, { method: 'DELETE' });
-      showToast('Exclusion mask deleted.');
-      async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-    }
-
-    async function deleteExclusion(id) {
-      await fetch(`/api/zones/exclusion/${id}`, { method: 'DELETE' });
-      showToast('Exclusion mask deleted.');
-      async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
+      try {
+        await fetch(`/api/zones/exclusion/${id}`, { method: 'DELETE' });
+        showToast('Exclusion Mask removed.');
+        loadZonesList();
+      } catch (e) { showToast('Failed to delete exclusion mask'); }
     }
 
     async function clearAllZones() {
-      if (confirm('Are you sure you want to remove all tripwires and restricted areas?')) {
+      if (confirm('Are you sure you want to remove all tripwires, restricted areas, and masks?')) {
         await fetch('/api/zones/clear', { method: 'POST' });
         showToast('All zones cleared.');
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
+        loadZonesList();
       }
     }
 
@@ -2357,109 +1922,13 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         const res = await fetch('/api/zones');
         const data = await res.json();
 
-        // Render Tripwires
+        // 1. Tripwires List
         const twContainer = document.getElementById('tripwiresListContainer');
-        twContainer.innerHTML = '';
         const tripwires = data.tripwires || [];
         if (tripwires.length === 0) {
           twContainer.innerHTML = '<div style="font-size: 11.5px; color: var(--text-dim);">No tripwires configured.</div>';
-        } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/exclusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name === 'Tripwire' || name === 'Restricted Area' ? 'Exclusion Mask' : name,
-            points: drawnPoints
-          })
-        });
-        showToast(`✅ Exclusion Mask '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/exclusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name === 'Tripwire' || name === 'Restricted Area' ? 'Exclusion Mask' : name,
-            points: drawnPoints
-          })
-        });
-        showToast(`✅ Exclusion Mask '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else {
+        } else {
+          twContainer.innerHTML = '';
           tripwires.forEach(tw => {
             const item = document.createElement('div');
             item.className = 'zone-item';
@@ -2474,109 +1943,13 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           });
         }
 
-        // Render Intrusion Zones
+        // 2. Intrusion Zones List
         const intContainer = document.getElementById('intrusionListContainer');
-        intContainer.innerHTML = '';
         const intrusion_zones = data.intrusion_zones || [];
         if (intrusion_zones.length === 0) {
           intContainer.innerHTML = '<div style="font-size: 11.5px; color: var(--text-dim);">No restricted areas configured.</div>';
-        } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/exclusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name === 'Tripwire' || name === 'Restricted Area' ? 'Exclusion Mask' : name,
-            points: drawnPoints
-          })
-        });
-        showToast(`✅ Exclusion Mask '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/exclusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name === 'Tripwire' || name === 'Restricted Area' ? 'Exclusion Mask' : name,
-            points: drawnPoints
-          })
-        });
-        showToast(`✅ Exclusion Mask '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else {
+        } else {
+          intContainer.innerHTML = '';
           intrusion_zones.forEach(iz => {
             const item = document.createElement('div');
             item.className = 'zone-item';
@@ -2590,76 +1963,21 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             intContainer.appendChild(item);
           });
         }
-        // Render Exclusion Masks
+
+        // 3. Exclusion Masks List
         const exContainer = document.getElementById('exclusionListContainer');
-        exContainer.innerHTML = '';
-        const exclusion_masks = data.exclusion_masks || [];
-        if (exclusion_masks.length === 0) {
-          exContainer.innerHTML = '<div style="font-size: 11.5px; color: var(--text-dim);">No exclusion masks configured.</div>';
-        } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/exclusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name === 'Tripwire' || name === 'Restricted Area' ? 'Exclusion Mask' : name,
-            points: drawnPoints
-          })
-        });
-        showToast(`✅ Exclusion Mask '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else {
-          exclusion_masks.forEach(ex => {
-            const item = document.createElement('div');
-            item.className = 'zone-item';
-            item.innerHTML = `
-              <div class="zone-info">
-                <span class="zone-name">🌫️ ${ex.name}</span>
-                <span class="zone-sub">${ex.points ? ex.points.length : 0} Vertices</span>
-              </div>
-              <button class="btn btn-danger btn-sm" onclick="deleteExclusion('${ex.id}')">🗑️ Remove</button>
-            `;
-            exContainer.appendChild(item);
-          });
-        }
-        // Render Exclusion Masks
-        const exContainer = document.getElementById('exclusionListContainer');
-        exContainer.innerHTML = '';
         const exclusion_masks = data.exclusion_masks || [];
         if (exclusion_masks.length === 0) {
           exContainer.innerHTML = '<div style="font-size: 11.5px; color: var(--text-dim);">No exclusion masks configured.</div>';
         } else {
+          exContainer.innerHTML = '';
           exclusion_masks.forEach(ex => {
             const item = document.createElement('div');
             item.className = 'zone-item';
             item.innerHTML = `
               <div class="zone-info">
                 <span class="zone-name">🌫️ ${ex.name}</span>
-                <span class="zone-sub">${ex.points ? ex.points.length : 0} Vertices</span>
+                <span class="zone-sub">${ex.points ? ex.points.length : 0} Vertices | [${ex.mask_mode || 'BLUR'}]</span>
               </div>
               <button class="btn btn-danger btn-sm" onclick="deleteExclusion('${ex.id}')">🗑️ Remove</button>
             `;
@@ -2667,6 +1985,39 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           });
         }
       } catch (e) {}
+    }
+
+    async function loadCameraSources() {
+      try {
+        const res = await fetch('/api/rescan', { method: 'POST' });
+        const data = await res.json();
+        const list = document.getElementById('cameraButtonsList');
+        list.innerHTML = '';
+
+        (data.sources || []).forEach((src, idx) => {
+          const btn = document.createElement('button');
+          btn.className = `cam-btn ${idx === 0 ? 'active' : ''}`;
+          btn.textContent = src.name;
+          btn.onclick = () => switchCameraFeed(src.url, btn);
+          list.appendChild(btn);
+        });
+      } catch (e) {}
+    }
+
+    async function switchCameraFeed(url, btnElement) {
+      try {
+        await fetch('/api/switch_source', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: url })
+        });
+        document.querySelectorAll('.cam-btn').forEach(b => b.classList.remove('active'));
+        if (btnElement) btnElement.classList.add('active');
+        showToast('Switched camera source.');
+        setTimeout(updateTelemetry, 800);
+      } catch (e) {
+        showToast('Failed to switch source');
+      }
     }
 
     function showToast(msg) {
@@ -2688,14 +2039,14 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       try {
         const res = await fetch('/api/action/clip', { method: 'POST' });
         const data = await res.json();
-        showToast(data.message || 'Exporting clip');
+        showToast(data.message || 'Exporting 15s clip');
       } catch (e) { showToast('Clip export failed'); }
     }
 
     async function rescanCameras() {
       showToast('Scanning network and USB devices...');
       try {
-        await fetch('/api/rescan', { method: 'POST' });
+        await loadCameraSources();
         showToast('Camera scan complete.');
       } catch (e) { showToast('Camera scan failed.'); }
     }
@@ -2717,103 +2068,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         if (data.is_fall_active) {
           fallStatus.textContent = '🚨 FALL DETECTED!';
           fallStatus.style.color = 'var(--accent-red)';
-        } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/exclusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name === 'Tripwire' || name === 'Restricted Area' ? 'Exclusion Mask' : name,
-            points: drawnPoints
-          })
-        });
-        showToast(`✅ Exclusion Mask '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/exclusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name === 'Tripwire' || name === 'Restricted Area' ? 'Exclusion Mask' : name,
-            points: drawnPoints
-          })
-        });
-        showToast(`✅ Exclusion Mask '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else {
+        } else {
           fallStatus.textContent = 'NORMAL';
           fallStatus.style.color = 'var(--accent-green)';
         }
@@ -2828,136 +2083,13 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             container.appendChild(item);
           });
         }
-        // Render Exclusion Masks
-        const exContainer = document.getElementById('exclusionListContainer');
-        exContainer.innerHTML = '';
-        const exclusion_masks = data.exclusion_masks || [];
-        if (exclusion_masks.length === 0) {
-          exContainer.innerHTML = '<div style="font-size: 11.5px; color: var(--text-dim);">No exclusion masks configured.</div>';
-        } else if (currentMode === 'EXCLUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zones/exclusion', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            name: name === 'Tripwire' || name === 'Restricted Area' ? 'Exclusion Mask' : name,
-            points: drawnPoints
-          })
-        });
-        showToast(`✅ Exclusion Mask '${name}' added!`);
-        clearCanvasPoints();
-        async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    loadZonesList();
-      } else {
-          exclusion_masks.forEach(ex => {
-            const item = document.createElement('div');
-            item.className = 'zone-item';
-            item.innerHTML = `
-              <div class="zone-info">
-                <span class="zone-name">🌫️ ${ex.name}</span>
-                <span class="zone-sub">${ex.points ? ex.points.length : 0} Vertices</span>
-              </div>
-              <button class="btn btn-danger btn-sm" onclick="deleteExclusion('${ex.id}')">🗑️ Remove</button>
-            `;
-            exContainer.appendChild(item);
-          });
-        }
-        // Render Exclusion Masks
-        const exContainer = document.getElementById('exclusionListContainer');
-        exContainer.innerHTML = '';
-        const exclusion_masks = data.exclusion_masks || [];
-        if (exclusion_masks.length === 0) {
-          exContainer.innerHTML = '<div style="font-size: 11.5px; color: var(--text-dim);">No exclusion masks configured.</div>';
-        } else {
-          exclusion_masks.forEach(ex => {
-            const item = document.createElement('div');
-            item.className = 'zone-item';
-            item.innerHTML = `
-              <div class="zone-info">
-                <span class="zone-name">🌫️ ${ex.name}</span>
-                <span class="zone-sub">${ex.points ? ex.points.length : 0} Vertices</span>
-              </div>
-              <button class="btn btn-danger btn-sm" onclick="deleteExclusion('${ex.id}')">🗑️ Remove</button>
-            `;
-            exContainer.appendChild(item);
-          });
-        }
       } catch (e) {}
     }
 
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
-    async function loadSources() {
-      const res = await fetch('/api/rescan', { method: 'POST' });
-      const data = await res.json();
-      const container = document.getElementById('cameraSwitcherContainer');
-      container.innerHTML = '<span style="font-size: 12px; font-weight: bold; color: var(--accent-cyan); white-space: nowrap;">📷 Camera Feeds:</span>';
-      data.sources.forEach(src => {
-        const btn = document.createElement('button');
-        btn.className = 'btn';
-        btn.style = 'white-space: nowrap; font-size: 11px; padding: 5px 8px;';
-        btn.textContent = src.name;
-        btn.onclick = () => switchSource(src.url);
-        container.appendChild(btn);
-      });
-    }
-    async function switchSource(url) {
-      await fetch('/api/switch_source', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: url })
-      });
-      showToast('Switched camera feed.');
-      setTimeout(updateTelemetry, 1000);
-    }
-    setTimeout(loadSources, 500);
     loadZonesList();
+    loadCameraSources();
     setInterval(updateTelemetry, 500);
-    setInterval(loadZonesList, 3000);
+    setInterval(loadZonesList, 3500);
   </script>
 </body>
 </html>
@@ -3007,58 +2139,6 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             "exclusion_masks": list(monitor.exclusion_masks.values())
         }
 
-
-    class ExclusionReq(BaseModel):
-        id: Optional[str] = None
-        name: Optional[str] = None
-        points: List[Dict[str, float]]
-
-    @web_app.post("/api/zones/exclusion")
-    async def add_or_update_exclusion(req: ExclusionReq):
-        data = req.model_dump()
-        ex_id = data.get("id") or f"ex_{int(time.time()*1000)}"
-        monitor.exclusion_masks[ex_id] = {
-            "id": ex_id,
-            "name": data.get("name", "Exclusion"),
-            "points": data.get("points", [])
-        }
-        monitor._save_persistent_zones()
-        return {"status": "ok"}
-
-    @web_app.delete("/api/zones/exclusion/{zone_id}")
-    async def delete_exclusion(zone_id: str):
-        if zone_id in monitor.exclusion_masks:
-            del monitor.exclusion_masks[zone_id]
-            monitor._save_persistent_zones()
-            return {"status": "ok"}
-        return {"status": "error"}
-
-
-    class ExclusionReq(BaseModel):
-        id: Optional[str] = None
-        name: Optional[str] = None
-        points: List[Dict[str, float]]
-
-    @web_app.post("/api/zones/exclusion")
-    async def add_or_update_exclusion(req: ExclusionReq):
-        data = req.model_dump()
-        ex_id = data.get("id") or f"ex_{int(time.time()*1000)}"
-        monitor.exclusion_masks[ex_id] = {
-            "id": ex_id,
-            "name": data.get("name", "Exclusion"),
-            "points": data.get("points", [])
-        }
-        monitor._save_persistent_zones()
-        return {"status": "ok"}
-
-    @web_app.delete("/api/zones/exclusion/{zone_id}")
-    async def delete_exclusion(zone_id: str):
-        if zone_id in monitor.exclusion_masks:
-            del monitor.exclusion_masks[zone_id]
-            monitor._save_persistent_zones()
-            return {"status": "ok"}
-        return {"status": "error"}
-
     @web_app.post("/api/zones/tripwire")
     async def add_or_update_tripwire(req: TripwireReq):
         tw_id = monitor.add_or_update_tripwire(req.model_dump())
@@ -3079,21 +2159,20 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         success = monitor.delete_intrusion_zone(zone_id)
         return {"status": "ok" if success else "error", "message": "Restricted Area deleted" if success else "Not found"}
 
+    @web_app.post("/api/zones/exclusion")
+    async def add_or_update_exclusion(req: ExclusionReq):
+        ex_id = monitor.add_or_update_exclusion_mask(req.model_dump())
+        return {"status": "ok", "id": ex_id, "message": "Exclusion Mask saved successfully"}
+
+    @web_app.delete("/api/zones/exclusion/{zone_id}")
+    async def delete_exclusion(zone_id: str):
+        success = monitor.delete_exclusion_mask(zone_id)
+        return {"status": "ok" if success else "error", "message": "Exclusion Mask deleted" if success else "Not found"}
+
     @web_app.post("/api/zones/clear")
     async def clear_all():
         monitor.clear_all_zones()
         return {"status": "ok", "message": "All zones cleared"}
-
-    # Backward compatibility aliases
-    @web_app.post("/api/zone/tripwire")
-    async def set_tripwire_legacy(req: TripwireReq):
-        tw_id = monitor.add_or_update_tripwire(req.model_dump())
-        return {"status": "ok", "id": tw_id, "message": "Tripwire saved"}
-
-    @web_app.post("/api/zone/intrusion")
-    async def set_intrusion_legacy(req: IntrusionReq):
-        iz_id = monitor.add_or_update_intrusion_zone(req.model_dump())
-        return {"status": "ok", "id": iz_id, "message": "Intrusion saved"}
 
     @web_app.post("/api/action/snapshot")
     async def take_snapshot():
@@ -3105,12 +2184,8 @@ def create_web_hud_app(monitor: LiveAIMonitor):
 
     @web_app.post("/api/action/clip")
     async def export_clip():
-        clip_path = settings.CLIPS_DIR / f"clip_{int(time.time())}.mp4"
-        pre_frames = monitor.ring_buffer.get_pre_event_frames()
-        if pre_frames:
-            clip_muxer.submit_mux_task(pre_frames, clip_path, fps=25)
-            monitor.trigger_alert(f"10s MP4 Clip Exported: {clip_path.name}", "CLIP_EXPORT", duration=3.0)
-        return {"status": "ok", "message": f"Exported: {clip_path.name}"}
+        monitor.record_15s_incident_clip("MANUAL")
+        return {"status": "ok", "message": "15s Incident Clip recording started"}
 
     @web_app.post("/api/rescan")
     async def rescan():
@@ -3151,13 +2226,14 @@ def main():
     server_thread.start()
 
     print("\n" + "=" * 75)
-    print("  🛡️  EDGE AI CCTV - MULTI-ZONE ENGINE & NOISE FILTER ACTIVE")
+    print("  🛡️  EDGE AI CCTV - MULTI-ZONE STUDIO ACTIVE")
     print("=" * 75)
     print(f"  🌐 Live Web HUD:  http://localhost:{args.port}")
     print(f"  🌐 Remote Access: http://0.0.0.0:{args.port}")
     print("  Advanced Security Features:")
+    print("  • Multi-Zone Studio: Tripwires, Restricted Areas, and Exclusion Masks")
+    print("  • Automatic 15-Second Clip Recording on Security Alarms")
     print("  • False-Alarm Rejection: Insects, moths, shadows, and reflections filtered")
-    print("  • Multi-Zone Studio: Add, edit, or completely remove multiple tripwires/areas")
     print("  • Multi-Class Neural Vision: Humans and Vehicles tracked with high confidence")
     print("  • Real-Time Fall Detection on live active persons")
     print("  • Press 'Q' or ESC to Exit")
@@ -3198,11 +2274,7 @@ def main():
                                 snap_path.write_bytes(jpeg)
                                 monitor.trigger_alert(f"Snapshot Saved: {snap_path.name}", "SNAPSHOT", duration=2.5)
                             elif key in (ord('r'), ord('R')):
-                                clip_path = settings.CLIPS_DIR / f"clip_{int(time.time())}.mp4"
-                                pre_frames = monitor.ring_buffer.get_pre_event_frames()
-                                if pre_frames:
-                                    clip_muxer.submit_mux_task(pre_frames, clip_path, fps=25)
-                                    monitor.trigger_alert(f"Event Clip Saved: {clip_path.name}", "CLIP", duration=3.0)
+                                monitor.record_15s_incident_clip("MANUAL")
                             elif key in (ord('c'), ord('C')):
                                 monitor.rescan_sources()
                         except Exception:
