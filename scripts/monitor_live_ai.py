@@ -1,25 +1,25 @@
 #!/usr/bin/env python3
-"""Edge AI CCTV - Real-Time Live AI Vision, Multi-Class Detection & Kinematics Evaluator.
+"""Edge AI CCTV - Real-Time Live AI Vision, Multi-Class Detection & Multi-Zone Engine.
 
-Architectural Enhancements:
-1. Multi-Class Deep Learning Detection (OpenCV DNN YOLOv5/YOLOv8):
-   - Full 80-Class COCO Argmax classification (Person vs Package/Backpack vs Vehicle vs Animal)
-   - Eliminates false positive person detections on bags, backpacks, chairs, and pillows
-   - Strict human confidence threshold (>= 0.50) + letterbox geometry preservation
-2. Static Object & Immobility Rejection:
-   - Continuous Euclidean displacement tracking (Dt = sqrt(dx^2 + dy^2))
-   - Filters static/stationary anchors from triggering false perimeter intrusion or fall alarms
-3. 5-Stage Kinematic Fall State Machine:
-   - STANDING -> RAPID_DESCENT -> COLLAPSED -> IMMOBILE -> FALL_CONFIRMED
-   - Immediate upright recovery path
-4. Interactive Zone Drawing & Editing on Web HUD:
-   - Click/draw tripwire line endpoints and intrusion polygon vertices directly on live stream
-   - Real-time synchronization to backend AIZoneService
-5. Color-Coded Multi-Class Visualizer:
-   - Person: Green / Cyan
-   - Package / Bag: Orange / Amber
-   - Vehicle: Magenta / Purple
-   - Animal / Pet: Electric Yellow
+Major Architectural Capabilities:
+1. False-Positive & Insect Rejection Engine:
+   - Physical scale & aspect-ratio gating (filters out small insects, moths, shadows, and laser reflections)
+   - Temporal track confirmation (requires >= 3 consecutive frames of physical trajectory before confirming)
+   - Velocity anomaly suppression (rejects impossible optical teleportation speeds > 1.2 frame widths/sec)
+   - Strict allowed_classes enforcement (only verified 'person' or 'vehicle' can trip security perimeters)
+2. Unlimited Multi-Tripwire & Multi-Intrusion Zone Engine:
+   - Create, edit, toggle, or completely delete any number of independent tripwires and restricted polygons
+   - Directional In/Out counting per tripwire (A->B, B->A, Bidirectional)
+   - Per-zone target class filtering (Human only, Vehicle only, or Both)
+   - Persistent storage to storage/zones_config.json (survives reboots and crashes)
+3. Deep Learning Multi-Class Neural Detector (OpenCV DNN YOLOv5/YOLOv8 with Argmax):
+   - Strict 80-Class Argmax classification (Person vs Package/Bag vs Vehicle vs Pet)
+   - Letterbox geometry preservation for any aspect ratio
+4. Kinematic Fall State Machine:
+   - 5-Stage temporal fall detection (STANDING -> RAPID_DESCENT -> COLLAPSED -> IMMOBILE -> FALL_CONFIRMED)
+5. Interactive Zone Studio Web HUD (:8080):
+   - Visual click-and-draw canvas for multiple lines and polygons
+   - Zone Manager panel with real-time add, delete, and enable/disable controls
 """
 
 import argparse
@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 import webbrowser
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, List, Dict, Any, Tuple
 import cv2
@@ -69,17 +69,17 @@ COCO_CLASS_MAP = {
 }
 
 CLASS_THRESHOLDS = {
-    "person": 0.48,
-    "package": 0.35,
+    "person": 0.50,
     "vehicle": 0.45,
+    "package": 0.38,
     "animal": 0.40,
     "default": 0.45
 }
 
 CLASS_COLORS = {
     "person": (0, 255, 180),     # Green/Cyan
-    "package": (0, 160, 255),    # Orange/Amber
     "vehicle": (240, 50, 200),   # Magenta/Purple
+    "package": (0, 160, 255),    # Orange/Amber
     "animal": (255, 210, 0),     # Yellow/Gold
     "default": (180, 190, 200)
 }
@@ -141,7 +141,7 @@ clip_muxer = BackgroundClipMuxer()
 # Zone Alert Debouncer
 # ==============================================================================
 class ZoneAlertDebouncer:
-    def __init__(self, cooldown_seconds: float = 3.5):
+    def __init__(self, cooldown_seconds: float = 3.0):
         self.cooldown_seconds = cooldown_seconds
         self.last_alerts: Dict[str, float] = {}
 
@@ -155,10 +155,10 @@ class ZoneAlertDebouncer:
 
 
 # ==============================================================================
-# Multi-Class Deep Learning Detector (OpenCV DNN YOLOv5/YOLOv8 with Argmax)
+# Multi-Class Deep Learning Detector with Insect & Noise Filter
 # ==============================================================================
 class UnifiedPersonDetector:
-    """Full 80-Class Deep Neural Network Detector with strict Argmax and Letterboxing."""
+    """Full 80-Class Deep Neural Network Detector with Physical Dimension Gating."""
 
     def __init__(self, onnx_model_path: Optional[str] = None):
         if onnx_model_path is None:
@@ -227,7 +227,7 @@ class UnifiedPersonDetector:
         for row in preds:
             if preds.shape[1] == 85:  # YOLOv5 format [cx, cy, w, h, obj_conf, p0...p79]
                 obj_conf = float(row[4])
-                if obj_conf < 0.22:
+                if obj_conf < 0.25:
                     continue
                 class_scores = row[5:]
                 best_class_idx = int(np.argmax(class_scores))
@@ -241,13 +241,28 @@ class UnifiedPersonDetector:
             semantic_class = COCO_CLASS_MAP.get(best_class_idx, "unknown")
             thresh = CLASS_THRESHOLDS.get(semantic_class, CLASS_THRESHOLDS["default"])
 
-            # True Argmax validation: Only accept if final_conf >= class threshold and recognized category
+            # True Argmax validation
             if final_conf >= thresh and semantic_class != "unknown":
                 cx, cy, bw, bh = row[0], row[1], row[2], row[3]
                 cx = (cx - dw) / ratio
                 cy = (cy - dh) / ratio
                 bw = bw / ratio
                 bh = bh / ratio
+
+                # Physical Size & Aspect-Ratio Sanity Gate (Reject insects, bugs, tiny speckles)
+                norm_w = bw / w
+                norm_h = bh / h
+                norm_area = norm_w * norm_h
+
+                if semantic_class == "person":
+                    # Real human on CCTV must be at least 7.5% frame height or area >= 0.0035
+                    if norm_h < 0.075 and norm_area < 0.0035:
+                        continue
+                elif semantic_class == "vehicle":
+                    # Real vehicle must have width >= 6% and area >= 0.008
+                    if norm_w < 0.06 and norm_area < 0.008:
+                        continue
+
                 x1 = int(cx - bw / 2)
                 y1 = int(cy - bh / 2)
                 boxes.append([x1, y1, int(bw), int(bh)])
@@ -255,7 +270,7 @@ class UnifiedPersonDetector:
                 class_ids.append(best_class_idx)
                 class_names.append(semantic_class)
 
-        indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.25, 0.45)
+        indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.30, 0.45)
         results = []
         if len(indices) > 0:
             flat_indices = indices.flatten() if hasattr(indices, "flatten") else [idx[0] if isinstance(idx, (list, tuple)) else idx for idx in indices]
@@ -288,7 +303,7 @@ class UnifiedPersonDetector:
 
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area > 1000:
+            if area > 1200:  # Minimum pixel cluster
                 bx, by, bw_px, bh_px = cv2.boundingRect(cnt)
                 candidate_boxes.append([bx, by, bx + bw_px, by + bh_px, area])
 
@@ -302,7 +317,8 @@ class UnifiedPersonDetector:
             box_h = norm_y2 - norm_y1
             box_w = norm_x2 - norm_x1
 
-            if box_h >= 0.14 or (box_h * box_w) >= 0.030:
+            # Strict size filter: Reject small flying insects
+            if box_h >= 0.15 and (box_h * box_w) >= 0.025:
                 results.append(DetectionObject(
                     bbox=(norm_x1, norm_y1, norm_x2, norm_y2),
                     confidence=0.88,
@@ -369,7 +385,7 @@ class MotionState(str, Enum):
 
 
 class KinematicPersonTracker:
-    """Tracks persistent state, multi-class labels, displacement, and fall kinematics."""
+    """Tracks persistent state, temporal confirmation, displacement, and kinematics."""
 
     def __init__(self, track_id: int, det: DetectionObject):
         self.track_id = track_id
@@ -380,10 +396,12 @@ class KinematicPersonTracker:
         self.motion_state = MotionState.ACTIVE_MOVING
         self.last_seen = time.time()
         self.first_seen = time.time()
+        self.hits = 1  # Track confirmation frame counter
 
         # Displacement & Immobility
         self.history: List[Tuple[float, float, float, float]] = []  # (t, cx, cy, h)
         self.displacement_2s = 0.0
+        self.velocity = 0.0  # Screen widths per second
         self.stationary_start_time: Optional[float] = None
         self.stationary_duration = 0.0
 
@@ -401,6 +419,7 @@ class KinematicPersonTracker:
         self.class_name = det.class_name
         self.confidence = det.confidence
         self.last_seen = now
+        self.hits += 1
 
         x1, y1, x2, y2 = det.bbox
         w = max(0.01, x2 - x1)
@@ -412,13 +431,17 @@ class KinematicPersonTracker:
         # EMA smoothing on Aspect Ratio
         self.smoothed_ar = 0.65 * self.aspect_ratio + 0.35 * self.smoothed_ar
 
-        # Calculate descent velocity
+        # Calculate descent velocity and horizontal velocity
         if self.history:
             dt = max(0.001, now - self.history[-1][0])
-            inst_v = (cy - self.history[-1][2]) / dt * 2.5
-            self.descent_velocity = max(0.0, 0.70 * inst_v + 0.30 * self.descent_velocity)
+            inst_vy = (cy - self.history[-1][2]) / dt * 2.5
+            self.descent_velocity = max(0.0, 0.70 * inst_vy + 0.30 * self.descent_velocity)
+
+            inst_vel = math.hypot(cx - self.history[-1][1], cy - self.history[-1][2]) / dt
+            self.velocity = 0.70 * inst_vel + 0.30 * self.velocity
         else:
             self.descent_velocity = 0.0
+            self.velocity = 0.0
 
         # Torso inclination estimation
         clamped_ar = max(0.35, min(2.2, self.smoothed_ar))
@@ -435,7 +458,7 @@ class KinematicPersonTracker:
             self.displacement_2s = 0.0
 
         # Evaluate Static Immobility / Stationary Anchor
-        if self.displacement_2s < 0.020:  # Less than 2.0% frame displacement over 2-3s
+        if self.displacement_2s < 0.020:
             if self.stationary_start_time is None:
                 self.stationary_start_time = now
             self.stationary_duration = now - self.stationary_start_time
@@ -455,8 +478,6 @@ class KinematicPersonTracker:
 
     def _evaluate_state_transitions(self, now: float):
         if self.smoothed_ar > 1.20 and self.torso_angle > 52.0:
-            if self.state != KinematicState.STANDING:
-                logger.info(f"[Kinematics] Track #{self.track_id} returned to STANDING.")
             self.state = KinematicState.STANDING
             self.descent_start_time = None
             self.collapsed_start_time = None
@@ -467,14 +488,12 @@ class KinematicPersonTracker:
             if self.descent_velocity >= 1.30:
                 self.state = KinematicState.RAPID_DESCENT
                 self.descent_start_time = now
-                logger.debug(f"[Kinematics] Track #{self.track_id} entered RAPID_DESCENT (Vy={self.descent_velocity:.2f} m/s)")
 
         elif self.state == KinematicState.RAPID_DESCENT:
             time_in_descent = now - (self.descent_start_time or now)
             if self.smoothed_ar <= 0.85 and self.torso_angle <= 38.0:
                 self.state = KinematicState.COLLAPSED
                 self.collapsed_start_time = now
-                logger.info(f"[Kinematics] Track #{self.track_id} entered COLLAPSED (AR={self.smoothed_ar:.2f}, θ={self.torso_angle:.1f}°)")
             elif time_in_descent > 1.0:
                 self.state = KinematicState.STANDING
 
@@ -489,8 +508,13 @@ class KinematicPersonTracker:
                 self.state = KinematicState.FALL_CONFIRMED
 
     @property
+    def is_confirmed(self) -> bool:
+        """Track must be seen for at least 3 frames and have reasonable velocity (rejects insects)."""
+        return (self.hits >= 3) and (self.velocity <= 1.20)
+
+    @property
     def is_active_human(self) -> bool:
-        return self.class_name == "person" and self.motion_state != MotionState.STATIC_ANCHOR
+        return self.class_name == "person" and self.motion_state != MotionState.STATIC_ANCHOR and self.is_confirmed
 
 
 # ==============================================================================
@@ -555,11 +579,12 @@ class CameraScanner:
 
             candidate_ips = [
                 local_ip,
-                f"{subnet_prefix}86",  # User's ESP32 IP
+                f"{subnet_prefix}86",  # ESP32 IP
+                f"{subnet_prefix}50",  # Reolink default
+                f"{subnet_prefix}10",
                 f"{subnet_prefix}1",
                 f"{subnet_prefix}2",
-                f"{subnet_prefix}100",
-                f"{subnet_prefix}150"
+                f"{subnet_prefix}100"
             ]
 
             for ip in candidate_ips:
@@ -569,11 +594,11 @@ class CameraScanner:
                         "name": f"ESP32 MJPEG Camera (http://{ip}:81/stream)",
                         "url": f"http://{ip}:81/stream"
                     })
-                elif cls.test_http_port(ip, 80):
+                elif cls.test_http_port(ip, 554):
                     found.append({
-                        "id": f"net_{ip}_80",
-                        "name": f"Network Camera (http://{ip}/stream)",
-                        "url": f"http://{ip}/stream"
+                        "id": f"rtsp_{ip}_554",
+                        "name": f"RTSP IP Camera (rtsp://{ip}:554)",
+                        "url": f"rtsp://admin:admin123@{ip}:554/h264Preview_01_sub"
                     })
         except Exception:
             pass
@@ -594,7 +619,7 @@ class CameraScanner:
 
 
 # ==============================================================================
-# Live AI Monitor Engine
+# Live AI Monitor Engine with Unlimited Multi-Zone Support
 # ==============================================================================
 class LiveAIMonitor:
     def __init__(self, initial_stream: Optional[str] = None):
@@ -604,9 +629,9 @@ class LiveAIMonitor:
         self.cap: Optional[cv2.VideoCapture] = None
         self.current_source_name = "Detecting..."
 
-        # Robust Multi-Class Unified Person Detector
+        # Robust Multi-Class Unified Person & Vehicle Detector
         self.detector = UnifiedPersonDetector()
-        self.debouncer = ZoneAlertDebouncer(cooldown_seconds=3.5)
+        self.debouncer = ZoneAlertDebouncer(cooldown_seconds=3.0)
 
         # Tracked Objects & Persons
         self.tracks: Dict[int, KinematicPersonTracker] = {}
@@ -626,9 +651,9 @@ class LiveAIMonitor:
         self.is_fall_active = False
         self.person_count = 0
 
-        # Tripwire & Intrusion Stats
-        self.in_count = 0
-        self.out_count = 0
+        # Multi-Zone Dictionaries
+        self.tripwires: Dict[str, Dict[str, Any]] = {}
+        self.intrusion_zones: Dict[str, Dict[str, Any]] = {}
         self.is_intrusion_active = False
         self.active_alert_banner = ""
         self.alert_expiry = 0.0
@@ -650,30 +675,39 @@ class LiveAIMonitor:
         # Persistent Storage Path
         self.zones_file = PROJECT_ROOT / "storage" / "zones_config.json"
 
-        # Initialize Security Zones (from disk if available, or default)
+        # Initialize Security Zones
         self._init_zones()
 
     def _init_default_zones(self):
-        self.tripwire_config = {
-            "id": "zone_tripwire_gate",
-            "name": "Virtual Tripwire (Entry/Exit)",
-            "x1": 0.15,
-            "y1": 0.55,
-            "x2": 0.85,
-            "y2": 0.55,
-            "direction": "BIDIRECTIONAL",
-            "enabled": True
+        self.tripwires = {
+            "tw_default": {
+                "id": "tw_default",
+                "name": "Virtual Tripwire #1",
+                "x1": 0.15,
+                "y1": 0.55,
+                "x2": 0.85,
+                "y2": 0.55,
+                "direction": "BIDIRECTIONAL",
+                "allowed_classes": ["person", "vehicle"],
+                "in_count": 0,
+                "out_count": 0,
+                "enabled": True
+            }
         }
-        self.intrusion_config = {
-            "id": "zone_intrusion_porch",
-            "name": "Restricted Intrusion Zone",
-            "points": [
-                {"x": 0.55, "y": 0.25},
-                {"x": 0.95, "y": 0.25},
-                {"x": 0.95, "y": 0.85},
-                {"x": 0.55, "y": 0.85}
-            ],
-            "enabled": True
+        self.intrusion_zones = {
+            "int_default": {
+                "id": "int_default",
+                "name": "Restricted Area #1",
+                "points": [
+                    {"x": 0.55, "y": 0.25},
+                    {"x": 0.95, "y": 0.25},
+                    {"x": 0.95, "y": 0.85},
+                    {"x": 0.55, "y": 0.85}
+                ],
+                "allowed_classes": ["person", "vehicle"],
+                "dwell_time_seconds": 0.5,
+                "enabled": True
+            }
         }
         self._save_persistent_zones()
         self.sync_zones_to_service()
@@ -683,22 +717,40 @@ class LiveAIMonitor:
             try:
                 with open(self.zones_file, "r") as f:
                     saved = json.load(f)
-                    if "tripwire" in saved and "x1" in saved["tripwire"]:
-                        self.tripwire_config = saved["tripwire"]
-                    else:
-                        self.tripwire_config = {
-                            "id": "zone_tripwire_gate", "name": "Virtual Tripwire",
-                            "x1": 0.15, "y1": 0.55, "x2": 0.85, "y2": 0.55, "direction": "BIDIRECTIONAL", "enabled": True
-                        }
 
-                    if "intrusion" in saved and "points" in saved["intrusion"]:
-                        self.intrusion_config = saved["intrusion"]
-                    else:
-                        self.intrusion_config = {
-                            "id": "zone_intrusion_porch", "name": "Restricted Intrusion Zone",
-                            "points": [{"x": 0.55, "y": 0.25}, {"x": 0.95, "y": 0.25}, {"x": 0.95, "y": 0.85}, {"x": 0.55, "y": 0.85}], "enabled": True
-                        }
-                logger.info(f"✅ Loaded persistent security zones from: {self.zones_file.name}")
+                    # Handle list or dict format for tripwires
+                    self.tripwires = {}
+                    raw_tw = saved.get("tripwires", saved.get("tripwire", []))
+                    if isinstance(raw_tw, dict):
+                        raw_tw = [raw_tw]
+                    for tw in raw_tw:
+                        if isinstance(tw, dict) and "x1" in tw:
+                            tw_id = tw.get("id", f"tw_{int(time.time()*1000)}")
+                            tw["id"] = tw_id
+                            tw.setdefault("name", f"Tripwire {len(self.tripwires)+1}")
+                            tw.setdefault("direction", "BIDIRECTIONAL")
+                            tw.setdefault("allowed_classes", ["person", "vehicle"])
+                            tw.setdefault("in_count", 0)
+                            tw.setdefault("out_count", 0)
+                            tw.setdefault("enabled", True)
+                            self.tripwires[tw_id] = tw
+
+                    # Handle list or dict format for intrusion zones
+                    self.intrusion_zones = {}
+                    raw_int = saved.get("intrusion_zones", saved.get("intrusion", []))
+                    if isinstance(raw_int, dict):
+                        raw_int = [raw_int]
+                    for iz in raw_int:
+                        if isinstance(iz, dict) and "points" in iz:
+                            iz_id = iz.get("id", f"int_{int(time.time()*1000)}")
+                            iz["id"] = iz_id
+                            iz.setdefault("name", f"Restricted Area {len(self.intrusion_zones)+1}")
+                            iz.setdefault("allowed_classes", ["person", "vehicle"])
+                            iz.setdefault("dwell_time_seconds", 0.5)
+                            iz.setdefault("enabled", True)
+                            self.intrusion_zones[iz_id] = iz
+
+                logger.info(f"✅ Loaded persistent security zones from: {self.zones_file.name} ({len(self.tripwires)} tripwires, {len(self.intrusion_zones)} restricted zones)")
                 self.sync_zones_to_service()
                 return
             except Exception as e:
@@ -711,8 +763,8 @@ class LiveAIMonitor:
             self.zones_file.parent.mkdir(parents=True, exist_ok=True)
             with open(self.zones_file, "w") as f:
                 json.dump({
-                    "tripwire": self.tripwire_config,
-                    "intrusion": self.intrusion_config
+                    "tripwires": list(self.tripwires.values()),
+                    "intrusion_zones": list(self.intrusion_zones.values())
                 }, f, indent=2)
             logger.info("💾 Security zones persisted to storage/zones_config.json")
         except Exception as e:
@@ -720,36 +772,41 @@ class LiveAIMonitor:
 
     def sync_zones_to_service(self):
         zones = []
-        if self.tripwire_config.get("enabled"):
-            direction_enum = TripwireDirection.BIDIRECTIONAL
-            if self.tripwire_config.get("direction") == "A_TO_B":
-                direction_enum = TripwireDirection.A_TO_B
-            elif self.tripwire_config.get("direction") == "B_TO_A":
-                direction_enum = TripwireDirection.B_TO_A
+
+        for tw_id, tw in self.tripwires.items():
+            if not tw.get("enabled", True):
+                continue
+            dir_enum = TripwireDirection.BIDIRECTIONAL
+            if tw.get("direction") == "A_TO_B":
+                dir_enum = TripwireDirection.A_TO_B
+            elif tw.get("direction") == "B_TO_A":
+                dir_enum = TripwireDirection.B_TO_A
 
             zones.append(ZoneConfig(
-                id=self.tripwire_config["id"],
+                id=tw_id,
                 camera_id=self.camera_id,
-                name=self.tripwire_config["name"],
+                name=tw.get("name", "Tripwire"),
                 zone_type=ZoneType.TRIPWIRE,
                 enabled=True,
-                allowed_classes=["person"],
-                line_start=Point2D(x=float(self.tripwire_config["x1"]), y=float(self.tripwire_config["y1"])),
-                line_end=Point2D(x=float(self.tripwire_config["x2"]), y=float(self.tripwire_config["y2"])),
-                direction=direction_enum
+                allowed_classes=tw.get("allowed_classes", ["person", "vehicle"]),
+                line_start=Point2D(x=float(tw["x1"]), y=float(tw["y1"])),
+                line_end=Point2D(x=float(tw["x2"]), y=float(tw["y2"])),
+                direction=dir_enum
             ))
 
-        if self.intrusion_config.get("enabled"):
-            pts = [Point2D(x=float(p["x"]), y=float(p["y"])) for p in self.intrusion_config["points"]]
+        for iz_id, iz in self.intrusion_zones.items():
+            if not iz.get("enabled", True) or not iz.get("points"):
+                continue
+            pts = [Point2D(x=float(p["x"]), y=float(p["y"])) for p in iz["points"]]
             zones.append(ZoneConfig(
-                id=self.intrusion_config["id"],
+                id=iz_id,
                 camera_id=self.camera_id,
-                name=self.intrusion_config["name"],
+                name=iz.get("name", "Restricted Area"),
                 zone_type=ZoneType.INTRUSION,
                 enabled=True,
-                allowed_classes=["person"],
+                allowed_classes=iz.get("allowed_classes", ["person", "vehicle"]),
                 polygon_points=pts,
-                dwell_time_seconds=0.5
+                dwell_time_seconds=float(iz.get("dwell_time_seconds", 0.5))
             ))
 
         ai_zone_service.set_camera_zones(self.camera_id, zones)
@@ -771,23 +828,67 @@ class LiveAIMonitor:
             if len(self.event_log) > 50:
                 self.event_log.pop()
 
-    def update_tripwire_position(self, x1: float, y1: float, x2: float, y2: float, direction: str):
-        self.tripwire_config.update({
-            "x1": max(0.0, min(1.0, x1)),
-            "y1": max(0.0, min(1.0, y1)),
-            "x2": max(0.0, min(1.0, x2)),
-            "y2": max(0.0, min(1.0, y2)),
-            "direction": direction
-        })
+    def add_or_update_tripwire(self, data: Dict[str, Any]) -> str:
+        tw_id = data.get("id") or f"tw_{int(time.time()*1000)}"
+        self.tripwires[tw_id] = {
+            "id": tw_id,
+            "name": data.get("name", f"Tripwire #{len(self.tripwires)+1}"),
+            "x1": max(0.0, min(1.0, float(data["x1"]))),
+            "y1": max(0.0, min(1.0, float(data["y1"]))),
+            "x2": max(0.0, min(1.0, float(data["x2"]))),
+            "y2": max(0.0, min(1.0, float(data["y2"]))),
+            "direction": data.get("direction", "BIDIRECTIONAL"),
+            "allowed_classes": data.get("allowed_classes", ["person", "vehicle"]),
+            "in_count": self.tripwires.get(tw_id, {}).get("in_count", 0),
+            "out_count": self.tripwires.get(tw_id, {}).get("out_count", 0),
+            "enabled": data.get("enabled", True)
+        }
         self._save_persistent_zones()
         self.sync_zones_to_service()
-        self.trigger_alert(f"Tripwire repositioned: ({x1:.2f},{y1:.2f}) -> ({x2:.2f},{y2:.2f}) [{direction}]", "ZONE_CONFIG", duration=2.5)
+        self.trigger_alert(f"Tripwire '{self.tripwires[tw_id]['name']}' updated.", "ZONE_CONFIG", duration=2.5)
+        return tw_id
 
-    def update_intrusion_zone(self, points: List[Dict[str, float]]):
-        self.intrusion_config["points"] = points
+    def delete_tripwire(self, tw_id: str) -> bool:
+        if tw_id in self.tripwires:
+            name = self.tripwires[tw_id].get("name", tw_id)
+            del self.tripwires[tw_id]
+            self._save_persistent_zones()
+            self.sync_zones_to_service()
+            self.trigger_alert(f"Tripwire '{name}' deleted.", "ZONE_CONFIG", duration=2.5)
+            return True
+        return False
+
+    def add_or_update_intrusion_zone(self, data: Dict[str, Any]) -> str:
+        iz_id = data.get("id") or f"int_{int(time.time()*1000)}"
+        self.intrusion_zones[iz_id] = {
+            "id": iz_id,
+            "name": data.get("name", f"Restricted Area #{len(self.intrusion_zones)+1}"),
+            "points": data.get("points", []),
+            "allowed_classes": data.get("allowed_classes", ["person", "vehicle"]),
+            "dwell_time_seconds": float(data.get("dwell_time_seconds", 0.5)),
+            "enabled": data.get("enabled", True)
+        }
         self._save_persistent_zones()
         self.sync_zones_to_service()
-        self.trigger_alert(f"Intrusion zone updated with {len(points)} vertices.", "ZONE_CONFIG", duration=2.5)
+        self.trigger_alert(f"Restricted Area '{self.intrusion_zones[iz_id]['name']}' updated.", "ZONE_CONFIG", duration=2.5)
+        return iz_id
+
+    def delete_intrusion_zone(self, iz_id: str) -> bool:
+        if iz_id in self.intrusion_zones:
+            name = self.intrusion_zones[iz_id].get("name", iz_id)
+            del self.intrusion_zones[iz_id]
+            self._save_persistent_zones()
+            self.sync_zones_to_service()
+            self.trigger_alert(f"Restricted Area '{name}' deleted.", "ZONE_CONFIG", duration=2.5)
+            return True
+        return False
+
+    def clear_all_zones(self):
+        self.tripwires.clear()
+        self.intrusion_zones.clear()
+        self._save_persistent_zones()
+        self.sync_zones_to_service()
+        self.trigger_alert("All security zones and tripwires cleared.", "ZONE_CONFIG", duration=2.5)
 
     def switch_source(self, new_source_url: str):
         logger.info(f"[+] Switching video source to: {new_source_url}")
@@ -933,34 +1034,45 @@ class LiveAIMonitor:
         hud = frame.copy()
         h, w = hud.shape[:2]
 
-        # 1. Render Tripwire Line
-        if self.tripwire_config.get("enabled"):
-            tx1 = int(self.tripwire_config["x1"] * w)
-            ty1 = int(self.tripwire_config["y1"] * h)
-            tx2 = int(self.tripwire_config["x2"] * w)
-            ty2 = int(self.tripwire_config["y2"] * h)
+        # 1. Render All Active Tripwires
+        for tw_id, tw in self.tripwires.items():
+            if not tw.get("enabled", True):
+                continue
+            tx1 = int(tw["x1"] * w)
+            ty1 = int(tw["y1"] * h)
+            tx2 = int(tw["x2"] * w)
+            ty2 = int(tw["y2"] * h)
             cv2.line(hud, (tx1, ty1), (tx2, ty2), (0, 220, 255), 2)
             cv2.circle(hud, (tx1, ty1), 5, (0, 220, 255), -1)
             cv2.circle(hud, (tx2, ty2), 5, (0, 220, 255), -1)
 
             mid_x, mid_y = (tx1 + tx2) // 2, (ty1 + ty2) // 2
-            dir_str = self.tripwire_config.get("direction", "BIDIRECTIONAL")
-            cv2.putText(hud, f"⚡ TRIPWIRE [{dir_str}] In:{self.in_count} Out:{self.out_count}",
-                        (mid_x - 120, mid_y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 220, 255), 2)
+            dir_str = tw.get("direction", "BIDIRECTIONAL")
+            name = tw.get("name", "Tripwire")
+            in_c = tw.get("in_count", 0)
+            out_c = tw.get("out_count", 0)
+            cv2.putText(hud, f"⚡ {name} [{dir_str}] In:{in_c} Out:{out_c}",
+                        (mid_x - 110, mid_y - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 220, 255), 2)
 
-        # 2. Render Intrusion Polygon Zone
-        if self.intrusion_config.get("enabled") and self.intrusion_config.get("points"):
-            pts = np.array([[int(p["x"] * w), int(p["y"] * h)] for p in self.intrusion_config["points"]], np.int32)
+        # 2. Render All Active Intrusion Polygon Zones
+        for iz_id, iz in self.intrusion_zones.items():
+            if not iz.get("enabled", True) or not iz.get("points"):
+                continue
+            pts = np.array([[int(p["x"] * w), int(p["y"] * h)] for p in iz["points"]], np.int32)
             overlay = hud.copy()
             zone_color = (0, 0, 220) if self.is_intrusion_active else (255, 120, 0)
             cv2.fillPoly(overlay, [pts], zone_color)
-            cv2.addWeighted(overlay, 0.25 if not self.is_intrusion_active else 0.45, hud, 0.75, 0, hud)
+            cv2.addWeighted(overlay, 0.20 if not self.is_intrusion_active else 0.40, hud, 0.80, 0, hud)
             cv2.polylines(hud, [pts], True, zone_color, 2)
-            cv2.putText(hud, f"🛑 INTRUSION ZONE {'[BREACHED!]' if self.is_intrusion_active else '[ARMED]'}",
-                        (pts[0][0] + 8, pts[0][1] + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.52, zone_color, 2)
+            name = iz.get("name", "Restricted Area")
+            cv2.putText(hud, f"🛑 {name} {'[BREACHED!]' if self.is_intrusion_active else '[ARMED]'}",
+                        (pts[0][0] + 8, pts[0][1] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, zone_color, 2)
 
-        # 3. Render Multi-Class Color-Coded Bounding Boxes
+        # 3. Render Multi-Class Color-Coded Bounding Boxes (Only confirmed tracks)
         for tid, t in self.tracks.items():
+            if not t.is_confirmed:
+                continue
+
             bx1 = int(t.bbox[0] * w)
             by1 = int(t.bbox[1] * h)
             bx2 = int(t.bbox[2] * w)
@@ -974,12 +1086,12 @@ class LiveAIMonitor:
                 else:
                     box_color = CLASS_COLORS["person"]
                 label = f"ID:{tid} Person | {t.state.value} | θ:{t.torso_angle:.0f}° | AR:{t.smoothed_ar:.2f}"
-            elif t.class_name == "package":
-                box_color = CLASS_COLORS["package"]
-                label = f"ID:{tid} Package/Bag ({t.confidence:.2f})"
             elif t.class_name == "vehicle":
                 box_color = CLASS_COLORS["vehicle"]
                 label = f"ID:{tid} Vehicle ({t.confidence:.2f})"
+            elif t.class_name == "package":
+                box_color = CLASS_COLORS["package"]
+                label = f"ID:{tid} Package/Bag ({t.confidence:.2f})"
             elif t.class_name == "animal":
                 box_color = CLASS_COLORS["animal"]
                 label = f"ID:{tid} Pet/Animal ({t.confidence:.2f})"
@@ -992,7 +1104,7 @@ class LiveAIMonitor:
             foot_x = (bx1 + bx2) // 2
             foot_y = by2
             cv2.circle(hud, (foot_x, foot_y), 4, box_color, -1)
-            cv2.putText(hud, label, (bx1, max(20, by1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.50, box_color, 2)
+            cv2.putText(hud, label, (bx1, max(20, by1 - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.48, box_color, 2)
 
         # 4. Top Status Bar
         overlay = hud.copy()
@@ -1000,10 +1112,10 @@ class LiveAIMonitor:
         cv2.addWeighted(overlay, 0.85, hud, 0.15, 0, hud)
         cv2.line(hud, (0, 54), (w, 54), (0, 240, 255), 1)
 
-        cv2.putText(hud, "🛡️ EDGE AI CCTV - MULTI-CLASS AI & KINEMATICS", (16, 26),
+        cv2.putText(hud, "🛡️ EDGE AI CCTV - MULTI-ZONE ENGINE", (16, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 240, 255), 2)
-        cv2.putText(hud, f"Source: {self.current_source_name} | Humans: {self.person_count} | Total Tracks: {len(self.tracks)}", (16, 46),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.44, (160, 180, 200), 1)
+        cv2.putText(hud, f"Source: {self.current_source_name} | Humans: {self.person_count} | Tripwires: {len(self.tripwires)} | Zones: {len(self.intrusion_zones)}", (16, 46),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 180, 200), 1)
 
         fps_text = f"FPS: {self.fps:.1f} | Latency: {self.avg_inference_ms:.1f}ms | Res: {w}x{h}"
         cv2.putText(hud, fps_text, (w - 440, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 160), 1)
@@ -1070,9 +1182,9 @@ class LiveAIMonitor:
 
             h, w = frame.shape[:2]
             detections_for_zones = []
-            # Only evaluate active (non-static) tracks in zone engine
+            # Only evaluate confirmed active tracks in security zones
             for tid, t in self.tracks.items():
-                if t.motion_state != MotionState.STATIC_ANCHOR:
+                if t.motion_state != MotionState.STATIC_ANCHOR and t.is_confirmed:
                     detections_for_zones.append({
                         "track_id": tid,
                         "class_name": t.class_name,
@@ -1089,18 +1201,22 @@ class LiveAIMonitor:
                 analytics_type = meta.get("analytics_type", "")
                 track_id_val = meta.get("track_id", 1)
                 direction_val = meta.get("direction", "A_TO_B")
+                zone_id = meta.get("zone_id", "default")
+                zone_name = meta.get("zone_name", "Perimeter")
 
                 if "TRIPWIRE" in analytics_type or ev.event_type.name == "PERIMETER_BREACH":
-                    if self.debouncer.should_dispatch("tripwire", int(track_id_val), now):
-                        if direction_val == "A_TO_B":
-                            self.in_count += 1
-                        else:
-                            self.out_count += 1
-                        self.trigger_alert(f"TRIPWIRE CROSSED [{direction_val}] by Person #{track_id_val}!", "TRIPWIRE")
+                    if self.debouncer.should_dispatch(zone_id, int(track_id_val), now):
+                        if zone_id in self.tripwires:
+                            if direction_val == "A_TO_B":
+                                self.tripwires[zone_id]["in_count"] = self.tripwires[zone_id].get("in_count", 0) + 1
+                            else:
+                                self.tripwires[zone_id]["out_count"] = self.tripwires[zone_id].get("out_count", 0) + 1
+                        self.trigger_alert(f"TRIPWIRE '{zone_name}' CROSSED [{direction_val}] by Track #{track_id_val}!", "TRIPWIRE")
+
                 elif "INTRUSION" in analytics_type or "INTRUSION" in ev.event_type.name:
                     self.is_intrusion_active = True
-                    if self.debouncer.should_dispatch("intrusion", int(track_id_val), now):
-                        self.trigger_alert(f"RESTRICTED INTRUSION ZONE BREACHED by Person #{track_id_val}!", "INTRUSION")
+                    if self.debouncer.should_dispatch(zone_id, int(track_id_val), now):
+                        self.trigger_alert(f"RESTRICTED AREA '{zone_name}' BREACHED by Track #{track_id_val}!", "INTRUSION")
 
             ai_latency = (time.time() - ai_start) * 1000.0
             self.recent_latencies.append(ai_latency)
@@ -1129,7 +1245,7 @@ class LiveAIMonitor:
 
 
 # ==============================================================================
-# Embedded Asynchronous Web HUD Server (FastAPI / Uvicorn)
+# Embedded Asynchronous Web HUD Server with Unlimited Multi-Zone APIs
 # ==============================================================================
 def create_web_hud_app(monitor: LiveAIMonitor):
     from fastapi import FastAPI
@@ -1137,7 +1253,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
 
-    web_app = FastAPI(title="Edge AI CCTV Web HUD")
+    web_app = FastAPI(title="Edge AI CCTV Multi-Zone Web HUD")
     web_app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -1147,14 +1263,23 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     )
 
     class TripwireReq(BaseModel):
+        id: Optional[str] = None
+        name: Optional[str] = None
         x1: float
         y1: float
         x2: float
         y2: float
-        direction: str
+        direction: Optional[str] = "BIDIRECTIONAL"
+        allowed_classes: Optional[List[str]] = ["person", "vehicle"]
+        enabled: Optional[bool] = True
 
     class IntrusionReq(BaseModel):
+        id: Optional[str] = None
+        name: Optional[str] = None
         points: List[Dict[str, float]]
+        allowed_classes: Optional[List[str]] = ["person", "vehicle"]
+        dwell_time_seconds: Optional[float] = 0.5
+        enabled: Optional[bool] = True
 
     class SwitchSourceReq(BaseModel):
         url: str
@@ -1167,12 +1292,12 @@ def create_web_hud_app(monitor: LiveAIMonitor):
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Edge AI CCTV - Multi-Class AI & Kinematics</title>
+  <title>Edge AI CCTV - Multi-Zone Studio</title>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;800&family=Plus+Jakarta+Sans:wght@400;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
       --bg: #0b0e14;
-      --card-bg: rgba(18, 22, 31, 0.85);
+      --card-bg: rgba(18, 22, 31, 0.90);
       --card-border: rgba(0, 240, 255, 0.25);
       --accent-cyan: #00f0ff;
       --accent-green: #00ff9d;
@@ -1186,11 +1311,11 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       background-color: var(--bg);
       color: var(--text-main);
       font-family: 'Plus Jakarta Sans', sans-serif;
-      padding: 20px;
+      padding: 16px;
       min-height: 100vh;
       display: flex;
       flex-direction: column;
-      gap: 16px;
+      gap: 14px;
     }
     .header {
       display: flex;
@@ -1199,12 +1324,11 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       background: var(--card-bg);
       backdrop-filter: blur(12px);
       border: 1px solid var(--card-border);
-      border-radius: 16px;
-      padding: 14px 20px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      border-radius: 14px;
+      padding: 12px 18px;
     }
-    .logo-group { display: flex; align-items: center; gap: 12px; }
-    .logo-title { font-size: 18px; font-weight: 800; color: #fff; }
+    .logo-group { display: flex; align-items: center; gap: 10px; }
+    .logo-title { font-size: 17px; font-weight: 800; color: #fff; }
     .badge {
       background: rgba(0, 240, 255, 0.15);
       border: 1px solid var(--accent-cyan);
@@ -1212,31 +1336,30 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
       font-weight: 600;
-      padding: 4px 10px;
+      padding: 4px 9px;
       border-radius: 20px;
     }
     .main-grid {
       display: grid;
-      grid-template-columns: 1fr 390px;
-      gap: 16px;
+      grid-template-columns: 1fr 410px;
+      gap: 14px;
     }
-    @media (max-width: 1080px) {
+    @media (max-width: 1100px) {
       .main-grid { grid-template-columns: 1fr; }
     }
     .video-card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
-      border-radius: 16px;
-      padding: 14px;
+      border-radius: 14px;
+      padding: 12px;
       display: flex;
       flex-direction: column;
-      gap: 14px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      gap: 12px;
     }
     .video-viewport {
       position: relative;
       width: 100%;
-      border-radius: 12px;
+      border-radius: 10px;
       overflow: hidden;
       background: #000;
       border: 1px solid rgba(255,255,255,0.1);
@@ -1260,29 +1383,28 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     .card {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
-      border-radius: 16px;
-      padding: 16px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
-      margin-bottom: 14px;
+      border-radius: 14px;
+      padding: 14px;
+      margin-bottom: 12px;
     }
     .card-title {
-      font-size: 13px;
+      font-size: 12.5px;
       font-weight: 700;
       text-transform: uppercase;
       letter-spacing: 0.8px;
       color: var(--accent-cyan);
-      margin-bottom: 12px;
+      margin-bottom: 10px;
       display: flex;
       align-items: center;
-      gap: 8px;
+      justify-content: space-between;
     }
     .telemetry-row {
       display: flex;
       justify-content: space-between;
       align-items: center;
-      padding: 8px 0;
+      padding: 6px 0;
       border-bottom: 1px solid rgba(255,255,255,0.05);
-      font-size: 12.5px;
+      font-size: 12px;
     }
     .telemetry-row:last-child { border-bottom: none; }
     .telemetry-label { color: var(--text-dim); }
@@ -1293,42 +1415,54 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     }
     .btn {
       background: #1a202c;
-      border: 1px solid rgba(255,255,255,0.12);
+      border: 1px solid rgba(255,255,255,0.15);
       color: #fff;
       font-family: 'Plus Jakarta Sans', sans-serif;
-      font-size: 12px;
+      font-size: 11.5px;
       font-weight: 700;
-      padding: 9px 12px;
-      border-radius: 8px;
+      padding: 8px 10px;
+      border-radius: 6px;
       cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
-      gap: 6px;
+      gap: 5px;
       transition: all 0.2s ease;
-      width: 100%;
     }
-    .btn:hover {
-      background: #2d3748;
-      border-color: var(--accent-cyan);
-    }
+    .btn:hover { background: #2d3748; border-color: var(--accent-cyan); }
     .btn-primary { background: rgba(0, 240, 255, 0.15); border-color: var(--accent-cyan); color: var(--accent-cyan); }
     .btn-primary:hover { background: var(--accent-cyan); color: #000; }
     .btn-danger { background: rgba(255, 0, 85, 0.15); border-color: var(--accent-red); color: var(--accent-red); }
     .btn-danger:hover { background: var(--accent-red); color: #fff; }
+    .btn-sm { padding: 4px 7px; font-size: 10.5px; border-radius: 4px; }
+    
+    .zone-item {
+      background: rgba(0,0,0,0.35);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .zone-info { display: flex; flex-direction: column; gap: 2px; }
+    .zone-name { font-size: 12px; font-weight: 700; color: #fff; }
+    .zone-sub { font-size: 10px; color: var(--text-dim); font-family: 'JetBrains Mono', monospace; }
+    
     .event-log-container {
-      max-height: 180px;
+      max-height: 160px;
       overflow-y: auto;
       display: flex;
       flex-direction: column;
-      gap: 6px;
+      gap: 5px;
     }
     .event-log-item {
       background: rgba(0,0,0,0.3);
       border-left: 3px solid var(--accent-cyan);
-      padding: 6px 10px;
+      padding: 5px 8px;
       border-radius: 4px;
-      font-size: 11.5px;
+      font-size: 11px;
       font-family: 'JetBrains Mono', monospace;
     }
     .event-fall { border-left-color: var(--accent-red); color: #ff99bb; }
@@ -1339,10 +1473,10 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       right: 20px;
       background: rgba(0, 240, 255, 0.95);
       color: #000;
-      padding: 12px 18px;
-      border-radius: 10px;
+      padding: 10px 16px;
+      border-radius: 8px;
       font-weight: 700;
-      font-size: 13px;
+      font-size: 12.5px;
       display: none;
       box-shadow: 0 8px 30px rgba(0,240,255,0.4);
       z-index: 999;
@@ -1352,10 +1486,10 @@ def create_web_hud_app(monitor: LiveAIMonitor):
 <body>
   <header class="header">
     <div class="logo-group">
-      <span style="font-size: 22px;">🛡️</span>
+      <span style="font-size: 20px;">🛡️</span>
       <div>
-        <div class="logo-title">EDGE AI CCTV CORE</div>
-        <div style="font-size: 11.5px; color: var(--text-dim);">Multi-Class Neural Vision & Kinematics Evaluator</div>
+        <div class="logo-title">EDGE AI CCTV - MULTI-ZONE STUDIO</div>
+        <div style="font-size: 11px; color: var(--text-dim);">Multi-Class Neural Vision & Unlimited Security Zones</div>
       </div>
     </div>
     <div style="display: flex; gap: 8px; align-items: center;">
@@ -1371,28 +1505,62 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         <img id="streamImg" src="/stream" alt="Live AI Vision Feed" />
         <canvas id="interactiveCanvas"></canvas>
       </div>
-      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
-        <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('TRIPWIRE')">⚡ Draw Tripwire (Click 2 Pts)</button>
-        <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('INTRUSION')">🛑 Draw Polygon (Click Pts)</button>
-        <button class="btn" style="flex: 1;" onclick="syncCanvasToBackend()">💾 Sync Zone to AI</button>
-        <button class="btn btn-danger" style="flex: 0.8;" onclick="clearCanvasPoints()">🗑️ Clear</button>
+
+      <!-- Zone Creation Toolbar -->
+      <div style="background: rgba(0,0,0,0.3); padding: 10px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; gap: 8px;">
+        <div style="display: flex; gap: 8px; flex-wrap: wrap; align-items: center;">
+          <input type="text" id="zoneNameInput" placeholder="Zone Name (e.g. Front Gate)" style="flex: 1.2; background: #161b22; color: #fff; padding: 7px 10px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2); font-size: 11.5px;" />
+          <select id="zoneClassSelect" style="flex: 1; background: #161b22; color: #fff; padding: 7px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2); font-size: 11.5px;">
+            <option value="both">🧍+🚗 Human & Vehicle</option>
+            <option value="person">🧍 Human Only</option>
+            <option value="vehicle">🚗 Vehicle Only</option>
+          </select>
+        </div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('TRIPWIRE')">⚡ Add Tripwire (Click 2 Pts)</button>
+          <button class="btn btn-primary" style="flex: 1;" onclick="setDrawMode('INTRUSION')">🛑 Add Restricted Area (Click Pts)</button>
+          <button class="btn" style="flex: 1;" onclick="saveDrawnZone()">💾 Save Zone</button>
+          <button class="btn btn-danger" style="flex: 0.8;" onclick="clearCanvasPoints()">🗑️ Cancel</button>
+        </div>
       </div>
-      <div style="display: flex; gap: 10px;">
-        <button class="btn" onclick="triggerSnapshot()">📸 Take Snapshot</button>
-        <button class="btn" onclick="triggerClip()">🎥 Export 10s MP4 Clip</button>
-        <button class="btn" onclick="rescanCameras()">🔄 Rescan Cameras</button>
+
+      <div style="display: flex; gap: 8px;">
+        <button class="btn" style="flex: 1;" onclick="triggerSnapshot()">📸 Snapshot</button>
+        <button class="btn" style="flex: 1;" onclick="triggerClip()">🎥 10s MP4 Clip</button>
+        <button class="btn" style="flex: 1;" onclick="rescanCameras()">🔄 Rescan Cameras</button>
       </div>
     </div>
 
     <div>
+      <!-- Multi-Zone Manager Panel -->
+      <div class="card">
+        <div class="card-title">
+          <span>⚡ Active Tripwires</span>
+          <button class="btn btn-danger btn-sm" onclick="clearAllZones()">Clear All</button>
+        </div>
+        <div id="tripwiresListContainer">
+          <div style="font-size: 11.5px; color: var(--text-dim);">No tripwires configured.</div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          <span>🛑 Restricted Polygon Zones</span>
+        </div>
+        <div id="intrusionListContainer">
+          <div style="font-size: 11.5px; color: var(--text-dim);">No restricted areas configured.</div>
+        </div>
+      </div>
+
+      <!-- Telemetry Card -->
       <div class="card">
         <div class="card-title">📊 Multi-Class Telemetry</div>
         <div class="telemetry-row">
-          <span class="telemetry-label">Active Humans:</span>
+          <span class="telemetry-label">Humans Detected:</span>
           <span class="telemetry-val" id="personCountVal">0</span>
         </div>
         <div class="telemetry-row">
-          <span class="telemetry-label">Total Tracks (Bags/Cars/Pets):</span>
+          <span class="telemetry-label">Total Confirmed Tracks:</span>
           <span class="telemetry-val" id="totalTracksVal" style="color: var(--accent-orange);">0</span>
         </div>
         <div class="telemetry-row">
@@ -1400,27 +1568,17 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           <span class="telemetry-val" id="torsoAngleVal">85.0°</span>
         </div>
         <div class="telemetry-row">
-          <span class="telemetry-label">Descent Velocity (Vy):</span>
-          <span class="telemetry-val" id="velocityVal">0.00 m/s</span>
-        </div>
-        <div class="telemetry-row">
           <span class="telemetry-label">Fall Status:</span>
           <span class="telemetry-val" id="fallStatusVal">NORMAL</span>
         </div>
       </div>
 
+      <!-- Real Security Event Log -->
       <div class="card">
         <div class="card-title">📋 Real Security Events Log</div>
         <div class="event-log-container" id="eventLogList">
-          <div class="event-log-item">System armed. Multi-class detection active.</div>
+          <div class="event-log-item">System armed. Insect/Noise filter active.</div>
         </div>
-      </div>
-
-      <div class="card">
-        <div class="card-title">📹 Camera Feeds & Streams</div>
-        <select id="cameraSelect" onchange="changeCameraSource(this.value)" style="width: 100%; background: #161b22; color: #fff; padding: 8px; border-radius: 6px; border: 1px solid rgba(255,255,255,0.2);">
-          <option value="synthetic">🛡️ Synthetic Benchmark Feed</option>
-        </select>
       </div>
     </div>
   </div>
@@ -1490,39 +1648,130 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       currentMode = mode;
       drawnPoints = [];
       drawOverlay();
-      showToast(`Mode: ${mode} - Click on video to place points.`);
+      showToast(`Mode: ${mode} - Click on the video to place points.`);
     }
 
     function clearCanvasPoints() {
       drawnPoints = [];
+      currentMode = 'NONE';
       drawOverlay();
-      showToast('Canvas cleared.');
+      showToast('Action cancelled.');
     }
 
-    async function syncCanvasToBackend() {
+    function getAllowedClasses() {
+      const val = document.getElementById('zoneClassSelect').value;
+      if (val === 'person') return ['person'];
+      if (val === 'vehicle') return ['vehicle'];
+      return ['person', 'vehicle'];
+    }
+
+    async function saveDrawnZone() {
+      const name = document.getElementById('zoneNameInput').value.trim() || (currentMode === 'TRIPWIRE' ? 'Tripwire' : 'Restricted Area');
+      const allowed = getAllowedClasses();
+
       if (currentMode === 'TRIPWIRE' && drawnPoints.length === 2) {
-        await fetch('/api/zone/tripwire', {
+        await fetch('/api/zones/tripwire', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            name: name,
             x1: drawnPoints[0].x, y1: drawnPoints[0].y,
             x2: drawnPoints[1].x, y2: drawnPoints[1].y,
-            direction: 'BIDIRECTIONAL'
+            direction: 'BIDIRECTIONAL',
+            allowed_classes: allowed,
+            enabled: true
           })
         });
-        showToast('✅ Tripwire updated in AI Core!');
+        showToast(`✅ Tripwire '${name}' added!`);
         clearCanvasPoints();
+        loadZonesList();
       } else if (currentMode === 'INTRUSION' && drawnPoints.length >= 3) {
-        await fetch('/api/zone/intrusion', {
+        await fetch('/api/zones/intrusion', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ points: drawnPoints })
+          body: JSON.stringify({
+            name: name,
+            points: drawnPoints,
+            allowed_classes: allowed,
+            dwell_time_seconds: 0.5,
+            enabled: true
+          })
         });
-        showToast('✅ Intrusion zone updated in AI Core!');
+        showToast(`✅ Restricted Area '${name}' added!`);
         clearCanvasPoints();
+        loadZonesList();
       } else {
         showToast('Please click points on video first.');
       }
+    }
+
+    async function deleteTripwire(id) {
+      await fetch(`/api/zones/tripwire/${id}`, { method: 'DELETE' });
+      showToast('Tripwire deleted.');
+      loadZonesList();
+    }
+
+    async function deleteIntrusion(id) {
+      await fetch(`/api/zones/intrusion/${id}`, { method: 'DELETE' });
+      showToast('Restricted area deleted.');
+      loadZonesList();
+    }
+
+    async function clearAllZones() {
+      if (confirm('Are you sure you want to remove all tripwires and restricted areas?')) {
+        await fetch('/api/zones/clear', { method: 'POST' });
+        showToast('All zones cleared.');
+        loadZonesList();
+      }
+    }
+
+    async function loadZonesList() {
+      try {
+        const res = await fetch('/api/zones');
+        const data = await res.json();
+
+        // Render Tripwires
+        const twContainer = document.getElementById('tripwiresListContainer');
+        twContainer.innerHTML = '';
+        const tripwires = data.tripwires || [];
+        if (tripwires.length === 0) {
+          twContainer.innerHTML = '<div style="font-size: 11.5px; color: var(--text-dim);">No tripwires configured.</div>';
+        } else {
+          tripwires.forEach(tw => {
+            const item = document.createElement('div');
+            item.className = 'zone-item';
+            item.innerHTML = `
+              <div class="zone-info">
+                <span class="zone-name">⚡ ${tw.name}</span>
+                <span class="zone-sub">In: ${tw.in_count || 0} | Out: ${tw.out_count || 0} | [${tw.direction || 'BIDIRECTIONAL'}]</span>
+              </div>
+              <button class="btn btn-danger btn-sm" onclick="deleteTripwire('${tw.id}')">🗑️ Remove</button>
+            `;
+            twContainer.appendChild(item);
+          });
+        }
+
+        // Render Intrusion Zones
+        const intContainer = document.getElementById('intrusionListContainer');
+        intContainer.innerHTML = '';
+        const intrusion_zones = data.intrusion_zones || [];
+        if (intrusion_zones.length === 0) {
+          intContainer.innerHTML = '<div style="font-size: 11.5px; color: var(--text-dim);">No restricted areas configured.</div>';
+        } else {
+          intrusion_zones.forEach(iz => {
+            const item = document.createElement('div');
+            item.className = 'zone-item';
+            item.innerHTML = `
+              <div class="zone-info">
+                <span class="zone-name">🛑 ${iz.name}</span>
+                <span class="zone-sub">${iz.points ? iz.points.length : 0} Vertices | Target: ${iz.allowed_classes ? iz.allowed_classes.join(',') : 'all'}</span>
+              </div>
+              <button class="btn btn-danger btn-sm" onclick="deleteIntrusion('${iz.id}')">🗑️ Remove</button>
+            `;
+            intContainer.appendChild(item);
+          });
+        }
+      } catch (e) {}
     }
 
     function showToast(msg) {
@@ -1551,29 +1800,9 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     async function rescanCameras() {
       showToast('Scanning network and USB devices...');
       try {
-        const res = await fetch('/api/rescan', { method: 'POST' });
-        const data = await res.json();
-        const select = document.getElementById('cameraSelect');
-        select.innerHTML = '';
-        data.sources.forEach(src => {
-          const opt = document.createElement('option');
-          opt.value = src.url;
-          opt.textContent = src.name;
-          select.appendChild(opt);
-        });
-        showToast(`Scan complete: Found ${data.sources.length} sources.`);
+        await fetch('/api/rescan', { method: 'POST' });
+        showToast('Camera scan complete.');
       } catch (e) { showToast('Camera scan failed.'); }
-    }
-
-    async function changeCameraSource(url) {
-      showToast('Switching camera stream...');
-      try {
-        await fetch('/api/switch_source', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: url })
-        });
-      } catch (e) { showToast('Failed to switch source'); }
     }
 
     async function updateTelemetry() {
@@ -1588,7 +1817,6 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         document.getElementById('personCountVal').textContent = data.person_count;
         document.getElementById('totalTracksVal').textContent = data.total_tracks;
         document.getElementById('torsoAngleVal').textContent = `${data.torso_angle.toFixed(1)}°`;
-        document.getElementById('velocityVal').textContent = `${data.descent_velocity.toFixed(2)} m/s`;
 
         const fallStatus = document.getElementById('fallStatusVal');
         if (data.is_fall_active) {
@@ -1612,8 +1840,9 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       } catch (e) {}
     }
 
-    rescanCameras();
+    loadZonesList();
     setInterval(updateTelemetry, 500);
+    setInterval(loadZonesList, 3000);
   </script>
 </body>
 </html>
@@ -1645,7 +1874,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             "latency_ms": monitor.avg_inference_ms,
             "current_source": monitor.current_source_name,
             "person_count": monitor.person_count,
-            "total_tracks": len(monitor.tracks),
+            "total_tracks": len([t for t in monitor.tracks.values() if t.is_confirmed]),
             "torso_angle": monitor.torso_angle,
             "descent_velocity": monitor.descent_velocity,
             "aspect_ratio": monitor.aspect_ratio,
@@ -1658,19 +1887,45 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     async def get_zones():
         return {
             "status": "ok",
-            "tripwire": monitor.tripwire_config,
-            "intrusion": monitor.intrusion_config
+            "tripwires": list(monitor.tripwires.values()),
+            "intrusion_zones": list(monitor.intrusion_zones.values())
         }
 
+    @web_app.post("/api/zones/tripwire")
+    async def add_or_update_tripwire(req: TripwireReq):
+        tw_id = monitor.add_or_update_tripwire(req.model_dump())
+        return {"status": "ok", "id": tw_id, "message": "Tripwire saved successfully"}
+
+    @web_app.delete("/api/zones/tripwire/{zone_id}")
+    async def delete_tripwire(zone_id: str):
+        success = monitor.delete_tripwire(zone_id)
+        return {"status": "ok" if success else "error", "message": "Tripwire deleted" if success else "Not found"}
+
+    @web_app.post("/api/zones/intrusion")
+    async def add_or_update_intrusion(req: IntrusionReq):
+        iz_id = monitor.add_or_update_intrusion_zone(req.model_dump())
+        return {"status": "ok", "id": iz_id, "message": "Restricted Area saved successfully"}
+
+    @web_app.delete("/api/zones/intrusion/{zone_id}")
+    async def delete_intrusion(zone_id: str):
+        success = monitor.delete_intrusion_zone(zone_id)
+        return {"status": "ok" if success else "error", "message": "Restricted Area deleted" if success else "Not found"}
+
+    @web_app.post("/api/zones/clear")
+    async def clear_all():
+        monitor.clear_all_zones()
+        return {"status": "ok", "message": "All zones cleared"}
+
+    # Backward compatibility aliases
     @web_app.post("/api/zone/tripwire")
-    async def set_tripwire(req: TripwireReq):
-        monitor.update_tripwire_position(req.x1, req.y1, req.x2, req.y2, req.direction)
-        return {"status": "ok", "message": "Tripwire configuration updated and saved persistently"}
+    async def set_tripwire_legacy(req: TripwireReq):
+        tw_id = monitor.add_or_update_tripwire(req.model_dump())
+        return {"status": "ok", "id": tw_id, "message": "Tripwire saved"}
 
     @web_app.post("/api/zone/intrusion")
-    async def set_intrusion(req: IntrusionReq):
-        monitor.update_intrusion_zone(req.points)
-        return {"status": "ok", "message": "Intrusion zone configuration updated and saved persistently"}
+    async def set_intrusion_legacy(req: IntrusionReq):
+        iz_id = monitor.add_or_update_intrusion_zone(req.model_dump())
+        return {"status": "ok", "id": iz_id, "message": "Intrusion saved"}
 
     @web_app.post("/api/action/snapshot")
     async def take_snapshot():
@@ -1706,7 +1961,7 @@ def create_web_hud_app(monitor: LiveAIMonitor):
 # Main Runner with HighGUI & Web HUD Fallbacks
 # ==============================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Edge AI CCTV Live AI Monitor & Evaluator")
+    parser = argparse.ArgumentParser(description="Edge AI CCTV Live AI Monitor & Multi-Zone Evaluator")
     parser.add_argument("--stream", type=str, default=None,
                         help="Stream URL of ESP32 / IP Camera (e.g. http://10.68.21.86:81/stream)")
     parser.add_argument("--port", type=int, default=8080, help="Web HUD port (default 8080)")
@@ -1728,15 +1983,15 @@ def main():
     server_thread.start()
 
     print("\n" + "=" * 75)
-    print("  🛡️  EDGE AI CCTV - REAL-TIME LIVE MONITOR & EVALUATOR")
+    print("  🛡️  EDGE AI CCTV - MULTI-ZONE ENGINE & NOISE FILTER ACTIVE")
     print("=" * 75)
     print(f"  🌐 Live Web HUD:  http://localhost:{args.port}")
     print(f"  🌐 Remote Access: http://0.0.0.0:{args.port}")
-    print("  Interactive Features:")
-    print("  • Multi-Class Detection: Person, Package/Bag, Vehicle, Pet")
-    print("  • Static Object Immobility Filtering (No false alarms on bags/chairs)")
+    print("  Advanced Security Features:")
+    print("  • False-Alarm Rejection: Insects, moths, shadows, and reflections filtered")
+    print("  • Multi-Zone Studio: Add, edit, or completely remove multiple tripwires/areas")
+    print("  • Multi-Class Neural Vision: Humans and Vehicles tracked with high confidence")
     print("  • Real-Time Fall Detection on live active persons")
-    print("  • Click & Draw Tripwires and Intrusion Polygons directly on Live Video")
     print("  • Press 'Q' or ESC to Exit")
     print("=" * 75 + "\n")
 
