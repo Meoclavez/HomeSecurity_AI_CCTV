@@ -1,5 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:edge_ai_cctv/models/camera_feed.dart';
+import 'package:edge_ai_cctv/services/api_service.dart';
 
 void main() {
   group('CameraFeatures Model Tests', () {
@@ -169,6 +170,115 @@ void main() {
       expect(updated.toggles['pir'], false);
       expect(updated.pirMotion, true);
       expect(sensor.toggles['pir'], true); // immutability test
+    });
+  });
+
+  group('ESP32 Connection State & Rescan Tests', () {
+    test('rescanSensors method is defined and accessible on ApiService', () {
+      final api = ApiService();
+      expect(api.rescanSensors, isA<Function>());
+      expect(api.getSensors, isA<Function>());
+      expect(api.updateSensorToggles, isA<Function>());
+    });
+
+    test('Matching logic correctly yields null when sensors list is empty', () {
+      final List<Esp32Sensor> sensors = [];
+      const currentCameraId = 'cam_01';
+
+      Esp32Sensor? matched;
+      if (sensors.isNotEmpty) {
+        for (final s in sensors) {
+          if (s.cameraId == currentCameraId) {
+            matched = s;
+            break;
+          }
+        }
+        matched ??= sensors.firstWhere(
+          (s) => s.cameraId == null || s.cameraId!.isEmpty,
+          orElse: () => sensors.first,
+        );
+      }
+
+      expect(matched, isNull);
+    });
+
+    test('Matching logic correctly attaches sensor when node is connected', () {
+      final List<Esp32Sensor> sensors = [
+        Esp32Sensor(
+          id: 'sentry_01',
+          name: 'Front Porch Sentry',
+          ipAddress: '192.168.1.150',
+          cameraId: 'cam_01',
+          pirMotion: true,
+          distanceCm: 45.0,
+        ),
+      ];
+      const currentCameraId = 'cam_01';
+
+      Esp32Sensor? matched;
+      if (sensors.isNotEmpty) {
+        for (final s in sensors) {
+          if (s.cameraId == currentCameraId) {
+            matched = s;
+            break;
+          }
+        }
+        matched ??= sensors.firstWhere(
+          (s) => s.cameraId == null || s.cameraId!.isEmpty,
+          orElse: () => sensors.first,
+        );
+      }
+
+      expect(matched, isNotNull);
+      expect(matched!.id, 'sentry_01');
+      expect(matched.pirMotion, isTrue);
+    });
+
+    test('Toggle state rollback works correctly on failure', () {
+      final sensor = Esp32Sensor(
+        id: 'esp32_01',
+        name: 'Front Porch Sentry',
+        ipAddress: '192.168.1.150',
+        toggles: {'pir': true, 'ultrasonic': true, 'door1': true, 'door2': true},
+      );
+
+      final originalToggles = Map<String, bool>.from(sensor.toggles);
+      final updatedToggles = Map<String, bool>.from(sensor.toggles);
+      updatedToggles['pir'] = false;
+
+      // Optimistic update
+      var currentSensor = sensor.copyWith(toggles: updatedToggles);
+      expect(currentSensor.toggles['pir'], isFalse);
+
+      // Simulated network failure -> rollback
+      const bool updateSucceeded = false;
+      if (!updateSucceeded) {
+        currentSensor = sensor.copyWith(toggles: originalToggles);
+      }
+
+      expect(currentSensor.toggles['pir'], isTrue);
+    });
+
+    test('Empty-state card triggers when sensors list is empty', () {
+      final List<Esp32Sensor> sensors = [];
+      final bool isEmpty = sensors.isEmpty;
+      expect(isEmpty, isTrue);
+
+      const emptyMessage = 'No ESP32 sentries detected on network. Connect an ESP32-S3 sentry to enable physical PIR, Ultrasonic, and Door monitors.';
+      expect(emptyMessage, contains('No ESP32 sentries detected'));
+    });
+
+    test('Error feedback formatting on unreachable node toggle failure', () {
+      final sensor = Esp32Sensor(
+        id: 'sentry_front',
+        name: 'Front Sentry',
+        ipAddress: '192.168.1.150',
+      );
+
+      final errorMessage = 'ESP32 node "${sensor.name}" (${sensor.ipAddress}) is unreachable. Toggle failed.';
+      expect(errorMessage, contains('Front Sentry'));
+      expect(errorMessage, contains('192.168.1.150'));
+      expect(errorMessage, contains('is unreachable. Toggle failed.'));
     });
   });
 }

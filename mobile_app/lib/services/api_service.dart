@@ -345,6 +345,58 @@ class ApiService {
     }
   }
 
+  Future<Map<String, dynamic>> rescanSensors() async {
+    const duration = Duration(seconds: 5);
+    final primaryEndpoint = '$_baseUrl/api/v1/sensors/scan';
+    final fallbackEndpoint = '$_baseUrl/api/sensors/rescan';
+
+    try {
+      developer.log('Triggering sensor scan at $primaryEndpoint', name: 'ApiService');
+      final response = await http
+          .post(
+            Uri.parse(primaryEndpoint),
+            headers: {'Content-Type': 'application/json'},
+          )
+          .timeout(duration);
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final decoded = jsonDecode(response.body);
+        return decoded is Map<String, dynamic>
+            ? decoded
+            : {'status': 'success', 'data': decoded};
+      }
+      developer.log('Primary scan endpoint returned HTTP ${response.statusCode}, trying fallback', name: 'ApiService');
+    } catch (e) {
+      developer.log('Primary sensor scan failed: $e. Trying fallback: $fallbackEndpoint', name: 'ApiService');
+    }
+
+    try {
+      developer.log('Triggering fallback sensor scan at $fallbackEndpoint', name: 'ApiService');
+      final response = await http
+          .post(
+            Uri.parse(fallbackEndpoint),
+            headers: {'Content-Type': 'application/json'},
+          )
+          .timeout(duration);
+
+      if (response.statusCode >= 200 && response.statusCode < 300) {
+        final decoded = jsonDecode(response.body);
+        return decoded is Map<String, dynamic>
+            ? decoded
+            : {'status': 'success', 'data': decoded};
+      } else {
+        throw HttpException('Fallback sensor scan returned HTTP ${response.statusCode}');
+      }
+    } catch (e) {
+      developer.log('Sensor scan failed across all endpoints: $e', name: 'ApiService', level: 900);
+      return {
+        'status': 'error',
+        'message': e.toString(),
+        'sensors': <dynamic>[],
+      };
+    }
+  }
+
   Future<List<Esp32Sensor>> getSensors() async {
     final endpoint = '$_baseUrl/api/v1/sensors';
     try {
@@ -356,33 +408,8 @@ class ApiService {
       final List<dynamic> list = data is List ? data : (data['sensors'] ?? []);
       return list.map((s) => Esp32Sensor.fromJson(s as Map<String, dynamic>)).toList();
     } catch (e) {
-      developer.log('Get sensors failed, falling back to detected node state: $e', name: 'ApiService');
-      return [
-        Esp32Sensor(
-          id: 'esp32_sentry_01',
-          name: 'Front Porch Sentry',
-          ipAddress: '192.168.1.145',
-          cameraId: 'cam_01',
-          pirMotion: true,
-          distanceCm: 48.5,
-          door1Open: false,
-          door2Open: false,
-          toggles: {'pir': true, 'ultrasonic': true, 'door1': true, 'door2': true},
-          lastHeartbeat: DateTime.now().subtract(const Duration(seconds: 4)),
-        ),
-        Esp32Sensor(
-          id: 'esp32_sentry_02',
-          name: 'Backyard Gate Sensor',
-          ipAddress: '192.168.1.146',
-          cameraId: 'cam_02',
-          pirMotion: false,
-          distanceCm: 175.0,
-          door1Open: true,
-          door2Open: false,
-          toggles: {'pir': true, 'ultrasonic': true, 'door1': true, 'door2': false},
-          lastHeartbeat: DateTime.now().subtract(const Duration(seconds: 14)),
-        ),
-      ];
+      developer.log('Get sensors failed, returning empty list: $e', name: 'ApiService');
+      return [];
     }
   }
 
@@ -407,7 +434,7 @@ class ApiService {
       return response.statusCode >= 200 && response.statusCode < 300;
     } catch (e) {
       developer.log('Update sensor toggles failed: $e', name: 'ApiService');
-      return true;
+      return false;
     }
   }
 }

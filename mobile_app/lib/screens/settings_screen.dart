@@ -64,10 +64,55 @@ class _SettingsScreenState extends State<SettingsScreen> {
     }
   }
 
+  Future<void> _scanForSensors() async {
+    if (_isLoadingSensors) return;
+    setState(() => _isLoadingSensors = true);
+    try {
+      final result = await _apiService.rescanSensors();
+      final sensors = await _apiService.getSensors();
+      if (mounted) {
+        setState(() {
+          _sensors = sensors;
+          _isLoadingSensors = false;
+        });
+
+        if (sensors.isNotEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Scan complete: Found ${sensors.length} ESP32 sentry node(s).'),
+              backgroundColor: AppTheme.liveGreen,
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        } else {
+          final message = result['message'] ?? 'No ESP32 sentries detected on network.';
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(message.toString()),
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isLoadingSensors = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Failed to scan for sentries: $e'),
+            backgroundColor: AppTheme.emergencyRed,
+          ),
+        );
+      }
+    }
+  }
+
   Future<void> _onToggleSensorFeature(Esp32Sensor sensor, String key, bool value) async {
+    final originalToggles = Map<String, bool>.from(sensor.toggles);
     final updatedToggles = Map<String, bool>.from(sensor.toggles);
     updatedToggles[key] = value;
 
+    // Optimistic update
     final updatedSensor = sensor.copyWith(toggles: updatedToggles);
     setState(() {
       final index = _sensors.indexWhere((s) => s.id == sensor.id);
@@ -76,7 +121,29 @@ class _SettingsScreenState extends State<SettingsScreen> {
       }
     });
 
-    await _apiService.updateSensorToggles(sensor.id, updatedToggles);
+    try {
+      final success = await _apiService.updateSensorToggles(sensor.id, updatedToggles);
+      if (!success) {
+        throw Exception('Node unreachable or failed to apply settings.');
+      }
+    } catch (e) {
+      // Revert optimistic update
+      if (mounted) {
+        setState(() {
+          final index = _sensors.indexWhere((s) => s.id == sensor.id);
+          if (index != -1) {
+            _sensors[index] = sensor.copyWith(toggles: originalToggles);
+          }
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('ESP32 node "${sensor.name}" (${sensor.ipAddress}) is unreachable. Toggle failed.'),
+            backgroundColor: AppTheme.emergencyRed,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+    }
   }
 
   void _openCameraAiConfigModal() {
@@ -428,26 +495,41 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ],
             ),
           ),
+          const SizedBox(height: 6),
+          // Scan for ESP32 Sentries Button
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppTheme.cyberBlue,
+                side: BorderSide(color: AppTheme.cyberBlue.withValues(alpha: 0.5)),
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              onPressed: _isLoadingSensors ? null : _scanForSensors,
+              icon: _isLoadingSensors
+                  ? const SizedBox(
+                      width: 16,
+                      height: 16,
+                      child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.cyberBlue),
+                    )
+                  : const Icon(Icons.radar, size: 18),
+              label: Text(
+                _isLoadingSensors ? 'Scanning for ESP32 Sentries...' : 'Scan for ESP32 Sentries',
+                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
           if (_isLoadingSensors)
             const Padding(
-              padding: EdgeInsets.symmetric(vertical: 8),
+              padding: EdgeInsets.symmetric(vertical: 16),
               child: Center(child: CircularProgressIndicator(color: AppTheme.cyberBlue)),
             )
           else if (_sensors.isEmpty)
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: AppTheme.cardSurface,
-                borderRadius: BorderRadius.circular(8),
-                border: Border.all(color: AppTheme.borderHighlight),
-              ),
-              child: const Text(
-                'No ESP32 sensor hardware detected on LAN. Ensure sensors are powered on and connected to Wi-Fi.',
-                style: TextStyle(color: Colors.white54, fontSize: 12),
-              ),
-            )
+            _buildEmptySensorsCard()
           else
-            ..._sensors.map((sensor) => _buildSensorNodeCard(sensor)).toList(),
+            ..._sensors.map((sensor) => _buildSensorNodeCard(sensor)),
 
           const Divider(color: AppTheme.borderHighlight),
 
@@ -662,22 +744,127 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
+  Widget _buildEmptySensorsCard() {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: AppTheme.cardSurface,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: AppTheme.borderHighlight),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.white.withValues(alpha: 0.05),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: const Icon(Icons.sensors_off, color: Colors.white38, size: 22),
+              ),
+              const SizedBox(width: 12),
+              const Expanded(
+                child: Text(
+                  'No ESP32 sentries detected on network. Connect an ESP32-S3 sentry to enable physical PIR, Ultrasonic, and Door monitors.',
+                  style: TextStyle(
+                    color: Colors.white70,
+                    fontSize: 12,
+                    height: 1.4,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          const Divider(color: AppTheme.borderHighlight),
+          const SizedBox(height: 8),
+          const Text(
+            'HARDWARE SENSOR CONTROLS (DISABLED - NO SENTRY CONNECTED)',
+            style: TextStyle(
+              fontSize: 10,
+              fontWeight: FontWeight.bold,
+              color: Colors.white38,
+              letterSpacing: 0.5,
+            ),
+          ),
+          const SizedBox(height: 6),
+          _buildPerSensorSwitch(
+            title: 'PIR Motion Sensor',
+            subtitle: 'Passive infrared human presence trigger (Disabled)',
+            icon: Icons.directions_walk,
+            value: false,
+            activeColor: AppTheme.emergencyRed,
+            onChanged: null,
+          ),
+          _buildPerSensorSwitch(
+            title: 'Ultrasonic Distance',
+            subtitle: 'HC-SR04 sonar proximity and range gauge (Disabled)',
+            icon: Icons.straighten,
+            value: false,
+            activeColor: Colors.amber,
+            onChanged: null,
+          ),
+          _buildPerSensorSwitch(
+            title: 'Door 1 Reed Switch',
+            subtitle: 'Primary entry magnetic portal contact (Disabled)',
+            icon: Icons.sensor_door,
+            value: false,
+            activeColor: AppTheme.cyberBlue,
+            onChanged: null,
+          ),
+          _buildPerSensorSwitch(
+            title: 'Door 2 Reed Switch',
+            subtitle: 'Secondary entry magnetic portal contact (Disabled)',
+            icon: Icons.sensor_door,
+            value: false,
+            activeColor: AppTheme.cyberBlue,
+            onChanged: null,
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildPerSensorSwitch({
     required String title,
     required String subtitle,
     required IconData icon,
     required bool value,
     required Color activeColor,
-    required ValueChanged<bool> onChanged,
+    required ValueChanged<bool>? onChanged,
   }) {
+    final bool isEnabled = onChanged != null;
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 2.0),
       child: SwitchListTile(
         dense: true,
         contentPadding: EdgeInsets.zero,
-        secondary: Icon(icon, color: value ? activeColor : Colors.white38, size: 20),
-        title: Text(title, style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600)),
-        subtitle: Text(subtitle, style: const TextStyle(fontSize: 10, color: Colors.white54)),
+        secondary: Icon(
+          icon,
+          color: isEnabled
+              ? (value ? activeColor : Colors.white38)
+              : Colors.white24,
+          size: 20,
+        ),
+        title: Text(
+          title,
+          style: TextStyle(
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+            color: isEnabled ? Colors.white : Colors.white38,
+          ),
+        ),
+        subtitle: Text(
+          subtitle,
+          style: TextStyle(
+            fontSize: 10,
+            color: isEnabled ? Colors.white54 : Colors.white24,
+          ),
+        ),
         value: value,
         activeThumbColor: activeColor,
         onChanged: onChanged,

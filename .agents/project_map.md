@@ -83,7 +83,8 @@ Edge_AI_CCTV/
 │   │   └── yolo11n-pose.onnx                 # SOTA YOLO11 17-keypoint skeletal pose estimation model
 │   ├── tests/
 │   │   ├── test_api.py                       # REST API, auth, ICE, zones, timeline, sensors & feature toggle tests
-│   │   └── test_kinematics.py                # Kinematics, polygon ray-casting & tripwire crossing unit tests
+│   │   ├── test_kinematics.py                # Kinematics, polygon ray-casting & tripwire crossing unit tests
+│   │   └── test_monitor_live_ai_integration.py # Auto-discovery, watchdog, state-aware toggles, demo mode, and concurrency tests
 │   ├── coturn/coturn.conf                    # Coturn TURN/STUN relay configuration (RFC 5766)
 │   ├── Caddyfile                             # Caddy reverse proxy config (TLS termination for HTTPS/WSS)
 │   ├── scripts/generate_certs.py             # Automated local TLS certificate generator with SAN extensions

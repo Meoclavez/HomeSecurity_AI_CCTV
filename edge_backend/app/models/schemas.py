@@ -369,6 +369,7 @@ class SensorNodeResponse(BaseModel):
     last_heartbeat: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    status: str = "OFFLINE"
 
     class Config:
         from_attributes = True

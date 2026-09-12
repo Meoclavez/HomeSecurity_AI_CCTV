@@ -486,3 +486,66 @@ def test_sensor_telemetry_and_incident_clip_triggering(client, auth_headers):
     res_disarmed = client.post("/api/v1/sensors/sentry_front_porch/telemetry", json=telemetry_door_alarm, headers=auth_headers)
     assert res_disarmed.status_code == 200
     assert res_disarmed.json()["incident_triggered"] is False
+
+
+def test_sensors_scan_endpoint(client, auth_headers):
+    # Test POST /api/v1/sensors/scan
+    res = client.post("/api/v1/sensors/scan", headers=auth_headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "success"
+    assert "scanned_ips" in data
+    assert "found_count" in data
+    assert "nodes" in data
+    assert isinstance(data["nodes"], list)
+
+
+def test_sensors_offline_marking_after_30s(client, auth_headers):
+    from datetime import datetime, timedelta
+    # 1. Register an old node whose last_heartbeat is 45s ago
+    reg_payload = {
+        "id": "sentry_stale_node",
+        "name": "Stale Node",
+        "ip_address": "192.168.1.199",
+        "node_type": "ESP32_SENTRY"
+    }
+    res = client.post("/api/v1/sensors/register", json=reg_payload, headers=auth_headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["status"] == "ONLINE"
+
+    # 2. Artificially set last_heartbeat to 45 seconds ago in SQLite
+    async def _age_node():
+        async with async_session_factory() as session:
+            st = select(SensorNodeModel).where(SensorNodeModel.id == "sentry_stale_node")
+            r = await session.execute(st)
+            node = r.scalar_one()
+            node.last_heartbeat = datetime.utcnow() - timedelta(seconds=45)
+            await session.commit()
+
+    asyncio.run(_age_node())
+
+    # 3. Listing sensors should now mark the node as OFFLINE
+    list_res = client.get("/api/v1/sensors", headers=auth_headers)
+    assert list_res.status_code == 200
+    nodes = list_res.json()
+    stale_node = next((n for n in nodes if n["id"] == "sentry_stale_node"), None)
+    assert stale_node is not None
+    assert stale_node["status"] == "OFFLINE"
+    assert stale_node["sensor_states"]["status"] == "OFFLINE"
+
+
+def test_sensor_toggles_timeout_and_unreachable(client, auth_headers, monkeypatch):
+    import httpx
+    monkeypatch.setenv("TEST_ESP32_FORWARD", "1")
+
+    # Mock httpx timeout to verify 504 Gateway Timeout
+    async def mock_post_timeout(*args, **kwargs):
+        raise httpx.TimeoutException("Mocked 2.0s timeout")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post_timeout)
+
+    update_payload = {"pir_enabled": True}
+    res = client.put("/api/v1/sensors/sentry_front_porch/toggles", json=update_payload, headers=auth_headers)
+    assert res.status_code == 504
+    assert "Gateway Timeout" in res.json()["detail"] or "timed out" in res.json()["detail"]

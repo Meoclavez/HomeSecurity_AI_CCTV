@@ -33,6 +33,15 @@ edge_backend/storage/snapshots/*.jpg
 edge_backend/storage/dvr/*
 edge_backend/storage/archives/*
 edge_backend/storage/logs/*
+storage/*.db
+storage/*.db-journal
+storage/*.db-wal
+storage/*.db-shm
+storage/clips/*.mp4
+storage/snapshots/*.jpg
+storage/dvr/*
+storage/archives/*
+storage/logs/*
 *.log
 
 # TLS / Certificates (Secrets)

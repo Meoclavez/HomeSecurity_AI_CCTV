@@ -4,7 +4,6 @@ import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../core/theme/app_theme.dart';
-import 'app_shell.dart';
 import 'login_screen.dart';
 
 class SetupWizardScreen extends StatefulWidget {

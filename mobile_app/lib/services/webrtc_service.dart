@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:developer' as developer;
-import 'package:flutter/foundation.dart';
 import 'package:flutter_webrtc/flutter_webrtc.dart';
 import 'package:http/http.dart' as http;
 import 'package:connectivity_plus/connectivity_plus.dart';
@@ -179,13 +178,9 @@ class WebRtcService {
           }
         }
         
-        // This is a naive implementation; in a real scenario you would track framesDecoded over time
-        // to see if it's increasing. For simplicity, we just check if any were decoded.
-        // A better check:
-        // if (!receivingFrames) {
-        //   developer.log('Watchdog: No frames received in last interval, recovering', name: 'WebRtcService');
-        //   _handleConnectionFailure();
-        // }
+        if (!receivingFrames) {
+          developer.log('Watchdog: No video frames decoded in last interval', name: 'WebRtcService');
+        }
       } catch (e) {
         // Stats not available or failed
       }
@@ -235,6 +230,14 @@ class WebRtcService {
       }
       await _localAudioStream!.dispose();
       _localAudioStream = null;
+    }
+    if (_audioSender != null) {
+      if (_peerConnection != null) {
+        try {
+          await _peerConnection!.removeTrack(_audioSender!);
+        } catch (_) {}
+      }
+      _audioSender = null;
     }
     if (renderer.srcObject != null) {
       for (var track in renderer.srcObject!.getTracks()) {

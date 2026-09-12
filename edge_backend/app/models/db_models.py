@@ -162,4 +162,13 @@ class SensorNodeModel(Base):
 
     camera: Mapped[Optional["CameraModel"]] = relationship("CameraModel", back_populates="sensor_nodes")
 
+    @property
+    def status(self) -> str:
+        if not self.last_heartbeat:
+            return "OFFLINE"
+        now = datetime.utcnow()
+        if (now - self.last_heartbeat).total_seconds() > 30:
+            return "OFFLINE"
+        return "ONLINE"
+
 

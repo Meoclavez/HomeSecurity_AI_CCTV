@@ -1,35 +1,5 @@
 {
-  "tripwire": {
-    "id": "zone_tripwire_gate",
-    "name": "Virtual Tripwire (Entry/Exit)",
-    "x1": 0.35,
-    "y1": 0.15,
-    "x2": 0.35,
-    "y2": 0.9,
-    "direction": "BIDIRECTIONAL",
-    "enabled": true
-  },
-  "intrusion": {
-    "id": "zone_intrusion_porch",
-    "name": "Restricted Intrusion Zone",
-    "points": [
-      {
-        "x": 0.0672740014015417,
-        "y": 0.07605985037406483
-      },
-      {
-        "x": 0.06096706377014716,
-        "y": 0.9800498753117207
-      },
-      {
-        "x": 0.31955150665732307,
-        "y": 0.9850374064837906
-      },
-      {
-        "x": 0.3251576734407849,
-        "y": 0.09226932668329177
-      }
-    ],
-    "enabled": true
-  }
+  "tripwires": [],
+  "intrusion_zones": [],
+  "exclusion_masks": []
 }

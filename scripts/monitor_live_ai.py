@@ -33,6 +33,8 @@ import socket
 import sys
 import threading
 import time
+import urllib.request
+import urllib.error
 import webbrowser
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -821,6 +823,107 @@ class CameraScanner:
 
 
 # ==============================================================================
+# ESP32 Sentry Auto-Discovery & Network Scanner
+# ==============================================================================
+class ESP32SentryScanner:
+    """Discovers and validates ESP32-S3 IoT Hardware Sentries across LAN and mDNS."""
+
+    @staticmethod
+    def test_http_port(host: str, port: int, timeout: float = 0.5) -> bool:
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(timeout)
+                return s.connect_ex((host, port)) == 0
+        except Exception:
+            return False
+
+    @classmethod
+    def scan_esp32_devices(cls) -> List[Dict[str, Any]]:
+        """Scans mDNS ('esp32-cctv.local'), checks subnet IPs on port 80/81 for /sensors or /status
+        with 0.5s socket/HTTP timeout. Verifies device responds with valid JSON containing
+        camera_id, pir_motion or free_heap.
+        """
+        candidate_ips: List[str] = []
+
+        # 1. Probe mDNS hostname 'esp32-cctv.local'
+        try:
+            mdns_ip = socket.gethostbyname("esp32-cctv.local")
+            if mdns_ip and mdns_ip not in candidate_ips:
+                candidate_ips.append(mdns_ip)
+        except Exception:
+            pass
+
+        # 2. Probe Local Subnet IPs
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            local_ip = "127.0.0.1"
+
+        ip_parts = local_ip.split(".")
+        if len(ip_parts) == 4:
+            subnet_prefix = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}."
+            known_suffixes = ["86", "87", "88", "50", "10", "20", "1", "2", "100", "101", "102", "150"]
+            for sfx in known_suffixes:
+                ip_str = f"{subnet_prefix}{sfx}"
+                if ip_str not in candidate_ips:
+                    candidate_ips.append(ip_str)
+
+        if local_ip not in candidate_ips:
+            candidate_ips.append(local_ip)
+        if "127.0.0.1" not in candidate_ips:
+            candidate_ips.append("127.0.0.1")
+
+        found_devices: List[Dict[str, Any]] = []
+        seen_ips = set()
+
+        def probe_target(ip: str, port: int) -> Optional[Dict[str, Any]]:
+            if not cls.test_http_port(ip, port, timeout=0.5):
+                return None
+
+            for endpoint in ("/sensors", "/status"):
+                url = f"http://{ip}:{port}{endpoint}"
+                try:
+                    req = urllib.request.Request(url, headers={"User-Agent": "Edge-CCTV-Scanner"})
+                    with urllib.request.urlopen(req, timeout=0.5) as resp:
+                        if resp.status == 200:
+                            body = resp.read().decode("utf-8")
+                            data = json.loads(body)
+                            if isinstance(data, dict) and any(k in data for k in ("camera_id", "pir_motion", "free_heap")):
+                                return {
+                                    "ip": ip,
+                                    "port": port,
+                                    "camera_id": data.get("camera_id", f"esp32_{ip.replace('.', '_')}"),
+                                    "url": f"http://{ip}:{port}",
+                                    "endpoint": endpoint,
+                                    "mac": data.get("mac") or data.get("mac_address"),
+                                    "data": data,
+                                    "free_heap": data.get("free_heap"),
+                                    "pir_motion": bool(data.get("pir_motion", False)),
+                                    "distance_cm": float(data.get("distance_cm", 0.0)),
+                                    "door1_open": bool(data.get("door1_open", False)),
+                                    "door2_open": bool(data.get("door2_open", False)),
+                                    "last_seen": time.time()
+                                }
+                except Exception:
+                    pass
+            return None
+
+        probe_pairs = [(ip, p) for ip in candidate_ips for p in (80, 81)]
+        with ThreadPoolExecutor(max_workers=30) as executor:
+            futures = [executor.submit(probe_target, ip, p) for ip, p in probe_pairs]
+            for f in futures:
+                res = f.result()
+                if res and res["ip"] not in seen_ips:
+                    seen_ips.add(res["ip"])
+                    found_devices.append(res)
+
+        return found_devices
+
+
+# ==============================================================================
 # Live AI Monitor Engine
 # ==============================================================================
 class LiveAIMonitor:
@@ -856,7 +959,17 @@ class LiveAIMonitor:
             "door2_open": False
         }
 
+        # ESP32 Sentry Hardware State & Auto-Discovery
+        self.is_esp32_connected: bool = False
+        self.esp32_connection_status: str = "DISCONNECTED"  # "DISCONNECTED", "SCANNING", "ONLINE", "ERROR"
+        self.connected_esp32_devices: List[Dict[str, Any]] = []
+        self.active_esp32_ip: Optional[str] = None
+        self.active_esp32_port: int = 80
+        self.demo_simulation_enabled: bool = False
+
         self.tracks: Dict[int, KinematicPersonTracker] = {}
+        self.tracks_lock = threading.Lock()
+        self.scan_lock = threading.Lock()
         self.next_track_id = 1
 
         self.fps = 0.0
@@ -893,6 +1006,10 @@ class LiveAIMonitor:
         self.zones_file = PROJECT_ROOT / "storage" / "zones_config.json"
 
         self._init_zones()
+
+        # Auto-scan ESP32 sentries on startup in background thread without blocking video stream initialization
+        self.esp32_watchdog_thread = threading.Thread(target=self._esp32_startup_and_watchdog_loop, daemon=True)
+        self.esp32_watchdog_thread.start()
 
     def _init_default_zones(self):
         self.tripwires = {
@@ -1183,6 +1300,95 @@ class LiveAIMonitor:
         self.trigger_alert(f"Scan complete: Found {len(sources)} video source(s).", "CAMERA_SCAN", duration=2.5)
         return sources
 
+    def scan_esp32_devices(self) -> List[Dict[str, Any]]:
+        with self.scan_lock:
+            self.esp32_connection_status = "SCANNING"
+            try:
+                devices = ESP32SentryScanner.scan_esp32_devices()
+                if devices:
+                    self.connected_esp32_devices = devices
+                    self.is_esp32_connected = True
+                    self.esp32_connection_status = "ONLINE"
+                    self.active_esp32_ip = devices[0]["ip"]
+                    self.active_esp32_port = devices[0].get("port", 80)
+                    d = devices[0].get("data", {})
+                    if "pir_motion" in d:
+                        self.esp32_sensor_readings["pir_motion"] = bool(d["pir_motion"])
+                    if "distance_cm" in d:
+                        self.esp32_sensor_readings["distance_cm"] = float(d["distance_cm"])
+                    if "door1_open" in d:
+                        self.esp32_sensor_readings["door1_open"] = bool(d["door1_open"])
+                    if "door2_open" in d:
+                        self.esp32_sensor_readings["door2_open"] = bool(d["door2_open"])
+                    logger.info(f"✅ Auto-discovered {len(devices)} ESP32 Sentry device(s). Active: {self.active_esp32_ip}:{self.active_esp32_port}")
+                    self.trigger_alert(f"ESP32 Sentry Connected: {self.active_esp32_ip}", "ESP32_ONLINE", duration=3.0)
+                else:
+                    self.connected_esp32_devices = []
+                    self.is_esp32_connected = False
+                    self.esp32_connection_status = "DISCONNECTED"
+                    logger.info("ℹ️ No physical ESP32 sentries detected on network. Running in disconnected standby mode.")
+                return devices
+            except Exception as e:
+                logger.error(f"Error during ESP32 auto-discovery: {e}")
+                self.connected_esp32_devices = []
+                self.is_esp32_connected = False
+                self.esp32_connection_status = "ERROR"
+                return []
+
+    def rescan_esp32_devices(self) -> List[Dict[str, Any]]:
+        logger.info("[+] Manually rescanning network for ESP32 hardware sentries...")
+        self.trigger_alert("Scanning LAN & mDNS for ESP32 sentries...", "ESP32_SCAN", duration=2.0)
+        devices = self.scan_esp32_devices()
+        if devices:
+            self.trigger_alert(f"Found {len(devices)} ESP32 Sentry ({self.active_esp32_ip})", "ESP32_ONLINE", duration=3.0)
+        else:
+            self.trigger_alert("⚠️ No physical ESP32 sentry discovered on subnet.", "ESP32_OFFLINE", duration=3.0)
+        return devices
+
+    def _ping_esp32_node(self, ip: str, port: int) -> bool:
+        """Pings active ESP32 on /sensors or /status endpoint with 0.8s timeout."""
+        for endpoint in ("/sensors", "/status"):
+            url = f"http://{ip}:{port}{endpoint}"
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "Edge-CCTV-Watchdog"})
+                with urllib.request.urlopen(req, timeout=0.8) as resp:
+                    if resp.status == 200:
+                        raw = resp.read().decode("utf-8")
+                        data = json.loads(raw)
+                        if isinstance(data, dict):
+                            if "pir_motion" in data:
+                                self.esp32_sensor_readings["pir_motion"] = bool(data["pir_motion"])
+                            if "distance_cm" in data:
+                                self.esp32_sensor_readings["distance_cm"] = float(data["distance_cm"])
+                            if "door1_open" in data:
+                                self.esp32_sensor_readings["door1_open"] = bool(data["door1_open"])
+                            if "door2_open" in data:
+                                self.esp32_sensor_readings["door2_open"] = bool(data["door2_open"])
+                            return True
+            except Exception:
+                pass
+        return ESP32SentryScanner.test_http_port(ip, port, timeout=0.8)
+
+    def _esp32_startup_and_watchdog_loop(self):
+        """Auto-scans in background thread on startup without blocking video streams,
+        then pings active ESP32 every 10s to detect disconnects.
+        """
+        time.sleep(0.5)
+        self.scan_esp32_devices()
+
+        while self.is_running:
+            time.sleep(10.0)
+            if not self.is_running:
+                break
+            if self.is_esp32_connected and self.active_esp32_ip:
+                alive = self._ping_esp32_node(self.active_esp32_ip, self.active_esp32_port)
+                if not alive:
+                    logger.warning(f"⚠️ Active ESP32 Sentry at {self.active_esp32_ip} became unresponsive! Marking OFFLINE.")
+                    self.is_esp32_connected = False
+                    self.esp32_connection_status = "ERROR"
+                    self.connected_esp32_devices = []
+                    self.trigger_alert(f"⚠️ ESP32 Sentry ({self.active_esp32_ip}) Unresponsive / OFFLINE!", "ESP32_OFFLINE", duration=4.0)
+
     def open_video_source(self):
         if self.stream_source and self.stream_source != "synthetic":
             logger.info(f"[+] Connecting to stream: {self.stream_source}")
@@ -1250,71 +1456,72 @@ class LiveAIMonitor:
             if not self.is_in_exclusion_mask(cx, cy):
                 valid_detections.append(det)
 
-        for det in valid_detections:
-            cx = (det.bbox[0] + det.bbox[2]) / 2.0
-            cy = (det.bbox[1] + det.bbox[3]) / 2.0
+        with self.tracks_lock:
+            for det in valid_detections:
+                cx = (det.bbox[0] + det.bbox[2]) / 2.0
+                cy = (det.bbox[1] + det.bbox[3]) / 2.0
 
-            best_track_id = None
-            best_score = float('inf')
+                best_track_id = None
+                best_score = float('inf')
 
-            for tid, t in self.tracks.items():
-                if tid in updated_tracks or t.class_name != det.class_name:
-                    continue
-                iou = self._compute_iou(det.bbox, t.bbox)
-                if iou >= 0.20:
-                    score = 1.0 - iou
-                    if score < best_score:
-                        best_score = score
-                        best_track_id = tid
-
-            if best_track_id is None:
                 for tid, t in self.tracks.items():
                     if tid in updated_tracks or t.class_name != det.class_name:
                         continue
-                    tx1, ty1, tx2, ty2 = t.bbox
-                    tcx, tcy = (tx1 + tx2) / 2.0, (ty1 + ty2) / 2.0
-                    dist = math.hypot(cx - tcx, cy - tcy)
-                    if dist < 0.22 and dist < best_score:
-                        best_score = dist
-                        best_track_id = tid
+                    iou = self._compute_iou(det.bbox, t.bbox)
+                    if iou >= 0.20:
+                        score = 1.0 - iou
+                        if score < best_score:
+                            best_score = score
+                            best_track_id = tid
 
-            if best_track_id is None:
-                best_track_id = self.next_track_id
-                self.next_track_id += 1
-                self.tracks[best_track_id] = KinematicPersonTracker(best_track_id, det)
+                if best_track_id is None:
+                    for tid, t in self.tracks.items():
+                        if tid in updated_tracks or t.class_name != det.class_name:
+                            continue
+                        tx1, ty1, tx2, ty2 = t.bbox
+                        tcx, tcy = (tx1 + tx2) / 2.0, (ty1 + ty2) / 2.0
+                        dist = math.hypot(cx - tcx, cy - tcy)
+                        if dist < 0.22 and dist < best_score:
+                            best_score = dist
+                            best_track_id = tid
 
-            self.tracks[best_track_id].update(det, now, fall_detection_enabled=fall_enabled)
-            updated_tracks.add(best_track_id)
+                if best_track_id is None:
+                    best_track_id = self.next_track_id
+                    self.next_track_id += 1
+                    self.tracks[best_track_id] = KinematicPersonTracker(best_track_id, det)
 
-        stale_ids = [tid for tid, t in self.tracks.items() if now - t.last_seen > 2.5]
-        for tid in stale_ids:
-            del self.tracks[tid]
+                self.tracks[best_track_id].update(det, now, fall_detection_enabled=fall_enabled)
+                updated_tracks.add(best_track_id)
 
-        active_humans = [t for t in self.tracks.values() if t.is_active_human]
-        self.person_count = len(active_humans)
+            stale_ids = [tid for tid, t in self.tracks.items() if now - t.last_seen > 2.5]
+            for tid in stale_ids:
+                del self.tracks[tid]
 
-        if active_humans:
-            primary = active_humans[0]
-            self.torso_angle = primary.torso_angle
-            self.aspect_ratio = primary.smoothed_ar
-            self.descent_velocity = primary.descent_velocity if fall_enabled else 0.0
-            self.floor_proximity = min(1.0, primary.bbox[3])
-            self.is_fall_active = (primary.state in (KinematicState.COLLAPSED, KinematicState.IMMOBILE, KinematicState.FALL_CONFIRMED)) if fall_enabled else False
+            active_humans = [t for t in self.tracks.values() if t.is_active_human]
+            self.person_count = len(active_humans)
 
-            if fall_enabled and primary.state == KinematicState.FALL_CONFIRMED and not primary.alert_dispatched:
-                primary.alert_dispatched = True
-                self.trigger_alert(
-                    f"CRITICAL FALL CONFIRMED! Torso={primary.torso_angle:.1f}°, Vy={primary.descent_velocity:.2f}m/s, AR={primary.smoothed_ar:.2f}",
-                    "FALL_DETECTED",
-                    duration=5.0
-                )
-                self.record_15s_incident_clip("FALL")
-        else:
-            self.torso_angle = 85.0
-            self.aspect_ratio = 1.9
-            self.descent_velocity = 0.0
-            self.floor_proximity = 0.15
-            self.is_fall_active = False
+            if active_humans:
+                primary = active_humans[0]
+                self.torso_angle = primary.torso_angle
+                self.aspect_ratio = primary.smoothed_ar
+                self.descent_velocity = primary.descent_velocity if fall_enabled else 0.0
+                self.floor_proximity = min(1.0, primary.bbox[3])
+                self.is_fall_active = (primary.state in (KinematicState.COLLAPSED, KinematicState.IMMOBILE, KinematicState.FALL_CONFIRMED)) if fall_enabled else False
+
+                if fall_enabled and primary.state == KinematicState.FALL_CONFIRMED and not primary.alert_dispatched:
+                    primary.alert_dispatched = True
+                    self.trigger_alert(
+                        f"CRITICAL FALL CONFIRMED! Torso={primary.torso_angle:.1f}°, Vy={primary.descent_velocity:.2f}m/s, AR={primary.smoothed_ar:.2f}",
+                        "FALL_DETECTED",
+                        duration=5.0
+                    )
+                    self.record_15s_incident_clip("FALL")
+            else:
+                self.torso_angle = 85.0
+                self.aspect_ratio = 1.9
+                self.descent_velocity = 0.0
+                self.floor_proximity = 0.15
+                self.is_fall_active = False
 
     def generate_synthetic_frame(self) -> np.ndarray:
         frame = np.full((720, 1280, 3), (24, 28, 36), dtype=np.uint8)
@@ -1513,33 +1720,58 @@ class LiveAIMonitor:
         overlay = hud.copy()
         cv2.rectangle(overlay, (ix, iy), (ix + iot_w, iy + iot_h), (12, 16, 24), -1)
         cv2.addWeighted(overlay, 0.85, hud, 0.15, 0, hud)
-        cv2.rectangle(hud, (ix, iy), (ix + iot_w, iy + iot_h), (0, 240, 255), 1)
+        border_col = (0, 240, 255) if self.is_esp32_connected else (0, 165, 255)
+        cv2.rectangle(hud, (ix, iy), (ix + iot_w, iy + iot_h), border_col, 1)
 
-        cv2.putText(hud, "📡 ESP32 IOT SENSORS", (ix + 10, iy + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 240, 255), 1)
+        if self.is_esp32_connected:
+            header_txt = f"📡 ESP32 ONLINE ({self.active_esp32_ip or 'OK'})"
+            header_col = (0, 255, 160)
+        elif self.demo_simulation_enabled:
+            header_txt = "🧪 ESP32 DEMO SIMULATION"
+            header_col = (255, 200, 0)
+        elif self.esp32_connection_status == "SCANNING":
+            header_txt = "📡 ESP32: SCANNING NETWORK..."
+            header_col = (0, 240, 255)
+        elif self.esp32_connection_status == "ERROR":
+            header_txt = "⚠️ ESP32: OFFLINE / UNREACHABLE"
+            header_col = (0, 0, 255)
+        else:
+            header_txt = "⚠️ ESP32: DISCONNECTED"
+            header_col = (0, 165, 255)
 
-        pir_act = self.esp32_sensor_readings.get("pir_motion", False)
-        pir_armed = self.feature_toggles.get("esp32_pir", True)
-        pir_txt = ("🚨 MOTION" if pir_act else "IDLE") if pir_armed else "DISABLED"
-        pir_col = (0, 0, 255) if (pir_act and pir_armed) else ((0, 255, 160) if pir_armed else (120, 130, 140))
-        cv2.putText(hud, f"• PIR Motion: {pir_txt}", (ix + 10, iy + 42),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, pir_col, 1)
+        cv2.putText(hud, header_txt, (ix + 10, iy + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.43, header_col, 1)
 
-        dist_armed = self.feature_toggles.get("esp32_ultrasonic", True)
-        dist_val = self.esp32_sensor_readings.get("distance_cm", 0.0)
-        dist_str = (f"{dist_val:.1f} cm" if dist_val > 0 else "--- cm") if dist_armed else "DISABLED"
-        cv2.putText(hud, f"• Distance: {dist_str}", (ix + 10, iy + 64),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 220, 240) if dist_armed else (120, 130, 140), 1)
+        if not self.is_esp32_connected and not self.demo_simulation_enabled:
+            cv2.putText(hud, "• PIR Motion: [DISCONNECTED]", (ix + 10, iy + 42),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.39, (120, 130, 140), 1)
+            cv2.putText(hud, "• Distance: [DISCONNECTED]", (ix + 10, iy + 64),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.39, (120, 130, 140), 1)
+            cv2.putText(hud, "• Doors: [DISCONNECTED]", (ix + 10, iy + 86),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.39, (120, 130, 140), 1)
+        else:
+            pir_act = self.esp32_sensor_readings.get("pir_motion", False)
+            pir_armed = self.feature_toggles.get("esp32_pir", True)
+            pir_txt = ("🚨 MOTION" if pir_act else "IDLE") if pir_armed else "DISABLED"
+            pir_col = (0, 0, 255) if (pir_act and pir_armed) else ((0, 255, 160) if pir_armed else (120, 130, 140))
+            cv2.putText(hud, f"• PIR Motion: {pir_txt}", (ix + 10, iy + 42),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, pir_col, 1)
 
-        d1_armed = self.feature_toggles.get("esp32_door1", True)
-        d2_armed = self.feature_toggles.get("esp32_door2", True)
-        d1_act = self.esp32_sensor_readings.get("door1_open", False)
-        d2_act = self.esp32_sensor_readings.get("door2_open", False)
-        d1_str = ("OPEN" if d1_act else "CLOSED") if d1_armed else "OFF"
-        d2_str = ("OPEN" if d2_act else "CLOSED") if d2_armed else "OFF"
-        door_col = (0, 0, 255) if ((d1_act and d1_armed) or (d2_act and d2_armed)) else (0, 255, 160)
-        cv2.putText(hud, f"• Doors: Front[{d1_str}] Back[{d2_str}]", (ix + 10, iy + 86),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, door_col, 1)
+            dist_armed = self.feature_toggles.get("esp32_ultrasonic", True)
+            dist_val = self.esp32_sensor_readings.get("distance_cm", 0.0)
+            dist_str = (f"{dist_val:.1f} cm" if dist_val > 0 else "--- cm") if dist_armed else "DISABLED"
+            cv2.putText(hud, f"• Distance: {dist_str}", (ix + 10, iy + 64),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 220, 240) if dist_armed else (120, 130, 140), 1)
+
+            d1_armed = self.feature_toggles.get("esp32_door1", True)
+            d2_armed = self.feature_toggles.get("esp32_door2", True)
+            d1_act = self.esp32_sensor_readings.get("door1_open", False)
+            d2_act = self.esp32_sensor_readings.get("door2_open", False)
+            d1_str = ("OPEN" if d1_act else "CLOSED") if d1_armed else "OFF"
+            d2_str = ("OPEN" if d2_act else "CLOSED") if d2_armed else "OFF"
+            door_col = (0, 0, 255) if ((d1_act and d1_armed) or (d2_act and d2_armed)) else (0, 255, 160)
+            cv2.putText(hud, f"• Doors: Front[{d1_str}] Back[{d2_str}]", (ix + 10, iy + 86),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.40, door_col, 1)
 
         # 9. Active Alert Banner
         if time.time() < self.alert_expiry:
@@ -1579,9 +1811,10 @@ class LiveAIMonitor:
             if not self.feature_toggles.get("object_detection", True):
                 # Completely skip DNN inference (near 0% compute)
                 detections = []
-                stale_ids = list(self.tracks.keys())
-                for tid in stale_ids:
-                    del self.tracks[tid]
+                with self.tracks_lock:
+                    stale_ids = list(self.tracks.keys())
+                    for tid in stale_ids:
+                        del self.tracks[tid]
                 self.person_count = 0
                 self.is_fall_active = False
                 self.is_intrusion_active = False
@@ -1684,7 +1917,7 @@ class LiveAIMonitor:
 # ==============================================================================
 def create_web_hud_app(monitor: LiveAIMonitor):
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, StreamingResponse
+    from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
 
@@ -2058,6 +2291,11 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       color: #ff99bb;
       animation: pulseAlert 1.2s infinite alternate;
     }
+    .sensor-badge.offline {
+      background: rgba(139, 148, 158, 0.15);
+      border-color: rgba(139, 148, 158, 0.4);
+      color: #8b949e;
+    }
     @keyframes pulseAlert {
       from { box-shadow: 0 0 2px rgba(255,0,85,0.4); }
       to { box-shadow: 0 0 10px rgba(255,0,85,0.8); }
@@ -2068,6 +2306,21 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       justify-content: space-between;
       padding-top: 4px;
       border-top: 1px solid rgba(255,255,255,0.05);
+    }
+    .sensor-switch-wrapper {
+      display: inline-flex;
+      align-items: center;
+    }
+    .sensor-toggles-disabled .sensor-switch-wrapper {
+      cursor: not-allowed !important;
+    }
+    .sensor-toggles-disabled .switch {
+      opacity: 0.45;
+      cursor: not-allowed !important;
+      pointer-events: none;
+    }
+    .sensor-toggles-disabled .sensor-sim-btn {
+      opacity: 0.45;
     }
     .toast {
       position: fixed;
@@ -2135,10 +2388,11 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         </div>
       </div>
 
-      <div style="display: flex; gap: 8px;">
+      <div style="display: flex; gap: 8px; flex-wrap: wrap;">
         <button class="btn" style="flex: 1;" onclick="triggerSnapshot()">📸 Snapshot</button>
         <button class="btn" style="flex: 1;" onclick="triggerClip()">🎥 15s MP4 Clip</button>
         <button class="btn" style="flex: 1;" onclick="rescanCameras()">🔄 Rescan Cameras</button>
+        <button class="btn btn-primary" style="flex: 1.2;" onclick="rescanESP32()">📡 Scan ESP32 Sentries</button>
       </div>
     </div>
 
@@ -2190,26 +2444,38 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         </div>
 
         <!-- ESP32 IoT Hardware Telemetry & Controls -->
-        <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 10px;">
-          <div style="font-size: 11px; font-weight: 700; color: var(--accent-cyan); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
-            <span>📡 ESP32 Hardware Telemetry</span>
-            <span style="font-size: 10px; color: var(--text-dim); font-family: 'JetBrains Mono', monospace;">Port :8080</span>
+        <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 10px;" id="esp32SentrySection">
+          <div style="font-size: 11px; font-weight: 700; color: var(--accent-cyan); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 4px;">
+            <div style="display: flex; align-items: center; gap: 6px;">
+              <span>📡 IoT Hardware Sentries</span>
+              <span class="badge" id="esp32StatusPill" style="font-size: 10px; padding: 2px 8px; border-radius: 12px; font-weight: 700; background: rgba(255,170,0,0.15); border: 1px solid #ffaa00; color: #ffaa00;">
+                ⚠️ NO SENTRY CONNECTED
+              </span>
+            </div>
+            <button class="btn btn-sm" id="btnDemoSim" style="font-size: 9.5px; padding: 2px 7px;" onclick="toggleDemoSimulation()">🧪 Demo Simulation</button>
           </div>
 
-          <div class="sensor-grid">
+          <!-- Disconnected Notice Banner -->
+          <div id="esp32NoticeBox" style="display: block; background: rgba(255,170,0,0.08); border: 1px dashed rgba(255,170,0,0.35); border-radius: 6px; padding: 7px 9px; margin-bottom: 8px; font-size: 10.5px; color: #ffca66; line-height: 1.35;">
+            ℹ️ Connect an ESP32-S3 Sentry node to enable physical PIR, Ultrasonic, and Door reed switches. Click <strong>"📡 Scan ESP32 Sentries"</strong> above to auto-detect.
+          </div>
+
+          <div class="sensor-grid sensor-toggles-disabled" id="sensorGridContainer">
             <!-- PIR Motion Sensor -->
             <div class="sensor-card">
               <div class="sensor-title-row">
                 <span class="sensor-name">🚶 PIR Motion</span>
-                <span class="sensor-badge idle" id="pirStatusBadge">IDLE</span>
+                <span class="sensor-badge offline" id="pirStatusBadge">OFFLINE</span>
               </div>
               <div class="sensor-controls-row">
                 <span style="color: var(--text-dim); font-size: 10px;">Armed:</span>
-                <label class="switch switch-sm">
-                  <input type="checkbox" id="toggle_esp32_pir" onchange="onToggleFeature('esp32_pir', this.checked)" checked>
-                  <span class="slider"></span>
-                </label>
-                <button class="btn btn-sm" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('pir')">Simulate</button>
+                <div class="sensor-switch-wrapper" onclick="handleSensorToggleClick('esp32_pir', event)">
+                  <label class="switch switch-sm">
+                    <input type="checkbox" id="toggle_esp32_pir" onchange="onToggleFeature('esp32_pir', this.checked)" disabled>
+                    <span class="slider"></span>
+                  </label>
+                </div>
+                <button class="btn btn-sm sensor-sim-btn" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('pir')">Simulate</button>
               </div>
             </div>
 
@@ -2217,15 +2483,17 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             <div class="sensor-card">
               <div class="sensor-title-row">
                 <span class="sensor-name">📏 Ultrasonic</span>
-                <span class="sensor-badge" id="distStatusBadge">--- cm</span>
+                <span class="sensor-badge offline" id="distStatusBadge">OFFLINE</span>
               </div>
               <div class="sensor-controls-row">
                 <span style="color: var(--text-dim); font-size: 10px;">Armed:</span>
-                <label class="switch switch-sm">
-                  <input type="checkbox" id="toggle_esp32_ultrasonic" onchange="onToggleFeature('esp32_ultrasonic', this.checked)" checked>
-                  <span class="slider"></span>
-                </label>
-                <button class="btn btn-sm" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('dist')">Ping</button>
+                <div class="sensor-switch-wrapper" onclick="handleSensorToggleClick('esp32_ultrasonic', event)">
+                  <label class="switch switch-sm">
+                    <input type="checkbox" id="toggle_esp32_ultrasonic" onchange="onToggleFeature('esp32_ultrasonic', this.checked)" disabled>
+                    <span class="slider"></span>
+                  </label>
+                </div>
+                <button class="btn btn-sm sensor-sim-btn" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('dist')">Ping</button>
               </div>
             </div>
 
@@ -2233,15 +2501,17 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             <div class="sensor-card">
               <div class="sensor-title-row">
                 <span class="sensor-name">🚪 Door 1 (Front)</span>
-                <span class="sensor-badge idle" id="door1StatusBadge">CLOSED</span>
+                <span class="sensor-badge offline" id="door1StatusBadge">OFFLINE</span>
               </div>
               <div class="sensor-controls-row">
                 <span style="color: var(--text-dim); font-size: 10px;">Armed:</span>
-                <label class="switch switch-sm">
-                  <input type="checkbox" id="toggle_esp32_door1" onchange="onToggleFeature('esp32_door1', this.checked)" checked>
-                  <span class="slider"></span>
-                </label>
-                <button class="btn btn-sm" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('door1')">Toggle</button>
+                <div class="sensor-switch-wrapper" onclick="handleSensorToggleClick('esp32_door1', event)">
+                  <label class="switch switch-sm">
+                    <input type="checkbox" id="toggle_esp32_door1" onchange="onToggleFeature('esp32_door1', this.checked)" disabled>
+                    <span class="slider"></span>
+                  </label>
+                </div>
+                <button class="btn btn-sm sensor-sim-btn" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('door1')">Toggle</button>
               </div>
             </div>
 
@@ -2249,15 +2519,17 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             <div class="sensor-card">
               <div class="sensor-title-row">
                 <span class="sensor-name">🚪 Door 2 (Back)</span>
-                <span class="sensor-badge idle" id="door2StatusBadge">CLOSED</span>
+                <span class="sensor-badge offline" id="door2StatusBadge">OFFLINE</span>
               </div>
               <div class="sensor-controls-row">
                 <span style="color: var(--text-dim); font-size: 10px;">Armed:</span>
-                <label class="switch switch-sm">
-                  <input type="checkbox" id="toggle_esp32_door2" onchange="onToggleFeature('esp32_door2', this.checked)" checked>
-                  <span class="slider"></span>
-                </label>
-                <button class="btn btn-sm" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('door2')">Toggle</button>
+                <div class="sensor-switch-wrapper" onclick="handleSensorToggleClick('esp32_door2', event)">
+                  <label class="switch switch-sm">
+                    <input type="checkbox" id="toggle_esp32_door2" onchange="onToggleFeature('esp32_door2', this.checked)" disabled>
+                    <span class="slider"></span>
+                  </label>
+                </div>
+                <button class="btn btn-sm sensor-sim-btn" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('door2')">Toggle</button>
               </div>
             </div>
           </div>
@@ -2644,8 +2916,60 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     }
 
     let isUserToggling = false;
+    let isEsp32ConnectedGlobal = false;
+    let isDemoModeGlobal = false;
+
+    function handleSensorToggleClick(feature, event) {
+      if (!isEsp32ConnectedGlobal && !isDemoModeGlobal) {
+        if (event) {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        showToast('⚠️ No physical ESP32 sentry connected on network! Please scan or connect device.');
+        return false;
+      }
+    }
+
+    async function rescanESP32() {
+      showToast('📡 Scanning subnet & mDNS for ESP32 sentries...');
+      const pill = document.getElementById('esp32StatusPill');
+      if (pill) {
+        pill.textContent = '⏳ SCANNING...';
+        pill.style.borderColor = 'var(--accent-cyan)';
+        pill.style.color = 'var(--accent-cyan)';
+      }
+      try {
+        const res = await fetch('/api/sensors/rescan', { method: 'POST' });
+        const data = await res.json();
+        if (data.is_connected) {
+          showToast(`✅ Connected to ${data.found_count} ESP32 sentry node(s)!`);
+        } else {
+          showToast('⚠️ No physical ESP32 sentries found on subnet.');
+        }
+        updateTelemetry();
+      } catch (e) {
+        showToast('❌ ESP32 rescan failed.');
+      }
+    }
+
+    async function toggleDemoSimulation() {
+      try {
+        const res = await fetch('/api/sensors/demo_mode', { method: 'POST' });
+        const data = await res.json();
+        showToast(data.demo_enabled ? '🧪 Demo Simulation ENABLED (Toggles Unlocked)' : 'Demo Simulation DISABLED');
+        updateTelemetry();
+      } catch (e) {
+        showToast('Failed to toggle demo simulation mode');
+      }
+    }
 
     async function onToggleFeature(feature, enabled) {
+      if (feature.startsWith('esp32_') && !isEsp32ConnectedGlobal && !isDemoModeGlobal) {
+        showToast('⚠️ No physical ESP32 sentry connected on network! Please scan or connect device.');
+        const el = document.getElementById(`toggle_${feature}`);
+        if (el) el.checked = !enabled;
+        return;
+      }
       isUserToggling = true;
       try {
         const res = await fetch('/api/toggles', {
@@ -2654,15 +2978,27 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           body: JSON.stringify({ feature: feature, enabled: enabled })
         });
         const data = await res.json();
+        if (!res.ok || data.status === 'error') {
+          showToast(data.message || 'Failed to update toggle: Disconnected');
+          const el = document.getElementById(`toggle_${feature}`);
+          if (el) el.checked = !enabled;
+          return;
+        }
         showToast(`Feature '${feature}' -> ${enabled ? 'ON' : 'OFF'}`);
       } catch (e) {
         showToast('Failed to update toggle');
+        const el = document.getElementById(`toggle_${feature}`);
+        if (el) el.checked = !enabled;
       } finally {
         setTimeout(() => { isUserToggling = false; }, 600);
       }
     }
 
     async function simulateSensor(type) {
+      if (!isEsp32ConnectedGlobal && !isDemoModeGlobal) {
+        showToast('⚠️ Connect an ESP32 or click "🧪 Demo Simulation" to test sensors.');
+        return;
+      }
       let payload = {};
       if (type === 'pir') {
         payload = { pir_motion: true };
@@ -2699,6 +3035,9 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       try {
         const res = await fetch('/api/status');
         const data = await res.json();
+
+        isEsp32ConnectedGlobal = !!data.is_esp32_connected;
+        isDemoModeGlobal = !!data.demo_simulation_enabled;
 
         document.getElementById('fpsBadge').textContent = `${data.fps.toFixed(1)} FPS`;
         document.getElementById('latencyBadge').textContent = `${data.latency_ms.toFixed(1)} ms`;
@@ -2744,8 +3083,81 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           }
         }
 
+        // Update ESP32 Sentry Status Header Pill & UI Locks
+        const esp32Pill = document.getElementById('esp32StatusPill');
+        const noticeBox = document.getElementById('esp32NoticeBox');
+        const gridContainer = document.getElementById('sensorGridContainer');
+        const demoBtn = document.getElementById('btnDemoSim');
+
+        if (demoBtn) {
+          demoBtn.textContent = isDemoModeGlobal ? '🧪 Exit Demo' : '🧪 Demo Simulation';
+          demoBtn.className = isDemoModeGlobal ? 'btn btn-sm btn-primary' : 'btn btn-sm';
+        }
+
+        const isUnlocked = isEsp32ConnectedGlobal || isDemoModeGlobal;
+
+        if (esp32Pill) {
+          if (isEsp32ConnectedGlobal) {
+            const devIp = (data.connected_esp32_devices && data.connected_esp32_devices.length > 0)
+              ? data.connected_esp32_devices[0].ip
+              : 'ONLINE';
+            esp32Pill.textContent = `🟢 ESP32 ONLINE: ${devIp}`;
+            esp32Pill.style.background = 'rgba(0, 255, 157, 0.15)';
+            esp32Pill.style.borderColor = 'var(--accent-green)';
+            esp32Pill.style.color = 'var(--accent-green)';
+          } else if (isDemoModeGlobal) {
+            esp32Pill.textContent = '🧪 DEMO SIMULATION';
+            esp32Pill.style.background = 'rgba(0, 240, 255, 0.18)';
+            esp32Pill.style.borderColor = 'var(--accent-cyan)';
+            esp32Pill.style.color = 'var(--accent-cyan)';
+          } else if (data.esp32_connection_status === 'SCANNING') {
+            esp32Pill.textContent = '⏳ SCANNING...';
+            esp32Pill.style.background = 'rgba(0, 240, 255, 0.15)';
+            esp32Pill.style.borderColor = 'var(--accent-cyan)';
+            esp32Pill.style.color = 'var(--accent-cyan)';
+          } else if (data.esp32_connection_status === 'ERROR') {
+            esp32Pill.textContent = '⚠️ ESP32 OFFLINE / ERROR';
+            esp32Pill.style.background = 'rgba(255, 0, 85, 0.18)';
+            esp32Pill.style.borderColor = 'var(--accent-red)';
+            esp32Pill.style.color = 'var(--accent-red)';
+          } else {
+            esp32Pill.textContent = '⚠️ NO SENTRY CONNECTED';
+            esp32Pill.style.background = 'rgba(255, 170, 0, 0.15)';
+            esp32Pill.style.borderColor = '#ffaa00';
+            esp32Pill.style.color = '#ffaa00';
+          }
+        }
+
+        if (noticeBox) {
+          noticeBox.style.display = isUnlocked ? 'none' : 'block';
+        }
+
+        if (gridContainer) {
+          if (isUnlocked) {
+            gridContainer.classList.remove('sensor-toggles-disabled');
+          } else {
+            gridContainer.classList.add('sensor-toggles-disabled');
+          }
+        }
+
+        ['toggle_esp32_pir', 'toggle_esp32_ultrasonic', 'toggle_esp32_door1', 'toggle_esp32_door2'].forEach(id => {
+          const el = document.getElementById(id);
+          if (el) {
+            el.disabled = !isUnlocked;
+          }
+        });
+
         // Sync ESP32 Sensor Telemetry Badges
-        if (data.esp32_sensor_readings) {
+        if (!isUnlocked) {
+          const pirBadge = document.getElementById('pirStatusBadge');
+          const distBadge = document.getElementById('distStatusBadge');
+          const d1Badge = document.getElementById('door1StatusBadge');
+          const d2Badge = document.getElementById('door2StatusBadge');
+          if (pirBadge) { pirBadge.textContent = 'OFFLINE'; pirBadge.className = 'sensor-badge offline'; }
+          if (distBadge) { distBadge.textContent = 'OFFLINE'; distBadge.className = 'sensor-badge offline'; }
+          if (d1Badge) { d1Badge.textContent = 'OFFLINE'; d1Badge.className = 'sensor-badge offline'; }
+          if (d2Badge) { d2Badge.textContent = 'OFFLINE'; d2Badge.className = 'sensor-badge offline'; }
+        } else if (data.esp32_sensor_readings) {
           const s = data.esp32_sensor_readings;
 
           // PIR Motion
@@ -2840,12 +3252,14 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     async def get_status():
         with monitor.event_lock:
             recent_events = list(monitor.event_log[:15])
+        with monitor.tracks_lock:
+            total_tracks = len([t for t in monitor.tracks.values() if t.is_confirmed])
         return {
             "fps": monitor.fps,
             "latency_ms": monitor.avg_inference_ms,
             "current_source": monitor.current_source_name,
             "person_count": monitor.person_count,
-            "total_tracks": len([t for t in monitor.tracks.values() if t.is_confirmed]),
+            "total_tracks": total_tracks,
             "torso_angle": monitor.torso_angle,
             "descent_velocity": monitor.descent_velocity,
             "aspect_ratio": monitor.aspect_ratio,
@@ -2853,6 +3267,10 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             "is_fall_active": monitor.is_fall_active,
             "feature_toggles": monitor.feature_toggles,
             "esp32_sensor_readings": monitor.esp32_sensor_readings,
+            "is_esp32_connected": monitor.is_esp32_connected,
+            "esp32_connection_status": monitor.esp32_connection_status,
+            "connected_esp32_devices": monitor.connected_esp32_devices,
+            "demo_simulation_enabled": monitor.demo_simulation_enabled,
             "events": recent_events
         }
 
@@ -2861,7 +3279,11 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         return {
             "status": "ok",
             "feature_toggles": monitor.feature_toggles,
-            "esp32_sensor_readings": monitor.esp32_sensor_readings
+            "esp32_sensor_readings": monitor.esp32_sensor_readings,
+            "is_esp32_connected": monitor.is_esp32_connected,
+            "esp32_connection_status": monitor.esp32_connection_status,
+            "connected_esp32_devices": monitor.connected_esp32_devices,
+            "demo_simulation_enabled": monitor.demo_simulation_enabled
         }
 
     @web_app.post("/api/toggles")
@@ -2870,6 +3292,26 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             data = await request.json()
         except Exception:
             data = {}
+
+        # Guard: Check if any esp32_* toggle is being toggled while disconnected and not in demo mode
+        toggling_esp32 = False
+        if "feature" in data and str(data["feature"]).startswith("esp32_"):
+            toggling_esp32 = True
+        elif "toggles" in data and isinstance(data["toggles"], dict):
+            if any(str(k).startswith("esp32_") for k in data["toggles"].keys()):
+                toggling_esp32 = True
+        else:
+            if any(str(k).startswith("esp32_") for k in data.keys() if k in monitor.feature_toggles):
+                toggling_esp32 = True
+
+        if toggling_esp32 and not monitor.is_esp32_connected and not monitor.demo_simulation_enabled:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "message": "No physical ESP32 sentry connected on network! Please scan or connect device."
+                }
+            )
 
         updated = {}
         if "feature" in data and "enabled" in data:
@@ -2892,7 +3334,38 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         return {
             "status": "ok",
             "updated": updated,
-            "feature_toggles": monitor.feature_toggles
+            "feature_toggles": monitor.feature_toggles,
+            "is_esp32_connected": monitor.is_esp32_connected,
+            "esp32_connection_status": monitor.esp32_connection_status,
+            "demo_simulation_enabled": monitor.demo_simulation_enabled
+        }
+
+    @web_app.post("/api/sensors/rescan")
+    async def rescan_esp32():
+        devices = monitor.rescan_esp32_devices()
+        return {
+            "status": "ok",
+            "found_count": len(devices),
+            "devices": devices,
+            "is_connected": monitor.is_esp32_connected,
+            "esp32_connection_status": monitor.esp32_connection_status
+        }
+
+    @web_app.post("/api/sensors/demo_mode")
+    async def toggle_demo_mode(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        if "enabled" in data:
+            monitor.demo_simulation_enabled = bool(data["enabled"])
+        else:
+            monitor.demo_simulation_enabled = not monitor.demo_simulation_enabled
+        return {
+            "status": "ok",
+            "demo_enabled": monitor.demo_simulation_enabled,
+            "is_connected": monitor.is_esp32_connected,
+            "esp32_connection_status": monitor.esp32_connection_status
         }
 
     @web_app.post("/api/sensors/esp32")
@@ -2901,6 +3374,12 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             data = await request.json()
         except Exception:
             data = {}
+
+        if data:
+            monitor.is_esp32_connected = True
+            monitor.esp32_connection_status = "ONLINE"
+            if "ip" in data:
+                monitor.active_esp32_ip = str(data["ip"])
 
         # 1. PIR Motion
         if "pir_motion" in data:
@@ -2939,7 +3418,9 @@ def create_web_hud_app(monitor: LiveAIMonitor):
         return {
             "status": "ok",
             "esp32_sensor_readings": monitor.esp32_sensor_readings,
-            "feature_toggles": monitor.feature_toggles
+            "feature_toggles": monitor.feature_toggles,
+            "is_esp32_connected": monitor.is_esp32_connected,
+            "esp32_connection_status": monitor.esp32_connection_status
         }
 
     @web_app.get("/api/zones")
@@ -2989,8 +3470,11 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     @web_app.post("/api/action/snapshot")
     async def take_snapshot():
         snap_path = settings.SNAPSHOTS_DIR / f"snapshot_{int(time.time())}.jpg"
-        if monitor.latest_encoded_jpeg:
-            snap_path.write_bytes(monitor.latest_encoded_jpeg)
+        with monitor.frame_lock:
+            jpeg = monitor.latest_encoded_jpeg
+        if jpeg:
+            snap_path.parent.mkdir(parents=True, exist_ok=True)
+            snap_path.write_bytes(jpeg)
             monitor.trigger_alert(f"Snapshot Saved: {snap_path.name}", "SNAPSHOT", duration=2.5)
         return {"status": "ok", "message": f"Snapshot saved: {snap_path.name}"}
 

@@ -34,6 +34,7 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
   CameraFeatures _cameraFeatures = const CameraFeatures();
   Esp32Sensor? _attachedSensor;
   Timer? _sensorPollTimer;
+  bool _isScanningSensors = false;
 
   late List<TimelineRecordingSegment> _recordingSegments;
   late List<TimelineEventPin> _eventPins;
@@ -75,20 +76,25 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
     try {
       final sensors = await _apiService.getSensors();
       if (!mounted) return;
-      final matched = sensors.firstWhere(
-        (s) => s.cameraId == _currentCamera.id,
-        orElse: () => sensors.isNotEmpty
-            ? sensors.first
-            : Esp32Sensor(
-                id: 'esp32_default',
-                name: 'Front Porch Sentry',
-                ipAddress: '192.168.1.145',
-                cameraId: _currentCamera.id,
-                pirMotion: true,
-                distanceCm: 48.5,
-                door1Open: false,
-                door2Open: false,
-              ),
+      if (sensors.isEmpty) {
+        if (_attachedSensor != null) {
+          setState(() {
+            _attachedSensor = null;
+          });
+        }
+        return;
+      }
+
+      Esp32Sensor? matched;
+      for (final s in sensors) {
+        if (s.cameraId == _currentCamera.id) {
+          matched = s;
+          break;
+        }
+      }
+      matched ??= sensors.firstWhere(
+        (s) => s.cameraId == null || s.cameraId!.isEmpty,
+        orElse: () => sensors.first,
       );
 
       setState(() {
@@ -96,6 +102,52 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
       });
     } catch (e) {
       debugPrint('Error loading sensors: $e');
+      if (mounted && _attachedSensor != null) {
+        setState(() {
+          _attachedSensor = null;
+        });
+      }
+    }
+  }
+
+  Future<void> _scanSensors() async {
+    if (_isScanningSensors) return;
+    setState(() => _isScanningSensors = true);
+    try {
+      final result = await _apiService.rescanSensors();
+      await _loadSensors();
+      if (!mounted) return;
+
+      if (_attachedSensor != null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Connected to Sentry: ${_attachedSensor!.name} (${_attachedSensor!.ipAddress})'),
+            backgroundColor: AppTheme.liveGreen,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      } else {
+        final message = result['message'] ?? 'Scan complete: No ESP32 sentries detected on network.';
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(message.toString()),
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Sensor scan failed: $e'),
+            backgroundColor: AppTheme.emergencyRed,
+          ),
+        );
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isScanningSensors = false);
+      }
     }
   }
 
@@ -350,10 +402,101 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
   Widget _buildIoTSensorStatusStrip() {
     final sensor = _attachedSensor;
     final bool hasSensor = sensor != null;
-    final bool isPirActive = hasSensor && sensor.pirMotion;
-    final double distance = hasSensor ? sensor.distanceCm : 0.0;
-    final bool door1Open = hasSensor && sensor.door1Open;
-    final bool door2Open = hasSensor && sensor.door2Open;
+
+    if (!hasSensor) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        decoration: BoxDecoration(
+          color: const Color(0xFF14181F),
+          border: Border(
+            top: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+            bottom: BorderSide(color: Colors.white.withValues(alpha: 0.08)),
+          ),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            // Clean pill badge: [No ESP32 Sentry Connected]
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+              decoration: BoxDecoration(
+                color: Colors.white.withValues(alpha: 0.05),
+                borderRadius: BorderRadius.circular(16),
+                border: Border.all(color: Colors.white.withValues(alpha: 0.15)),
+              ),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Container(
+                    width: 7,
+                    height: 7,
+                    decoration: const BoxDecoration(
+                      color: Colors.white38,
+                      shape: BoxShape.circle,
+                    ),
+                  ),
+                  const SizedBox(width: 6),
+                  const Text(
+                    'No ESP32 Sentry Connected',
+                    style: TextStyle(
+                      color: Colors.white70,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.3,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+
+            // Small "Scan" action button
+            InkWell(
+              onTap: _isScanningSensors ? null : _scanSensors,
+              borderRadius: BorderRadius.circular(16),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                decoration: BoxDecoration(
+                  color: AppTheme.cyberBlue.withValues(alpha: 0.15),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: AppTheme.cyberBlue.withValues(alpha: 0.6)),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (_isScanningSensors)
+                      const SizedBox(
+                        width: 11,
+                        height: 11,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          color: AppTheme.cyberBlue,
+                        ),
+                      )
+                    else
+                      const Icon(Icons.radar, size: 12, color: AppTheme.cyberBlue),
+                    const SizedBox(width: 5),
+                    Text(
+                      _isScanningSensors ? 'Scanning...' : 'Scan',
+                      style: const TextStyle(
+                        color: AppTheme.cyberBlue,
+                        fontSize: 11,
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
+    final bool isPirActive = sensor.pirMotion;
+    final double distance = sensor.distanceCm;
+    final bool door1Open = sensor.door1Open;
+    final bool door2Open = sensor.door2Open;
 
     return Container(
       width: double.infinity,
@@ -376,16 +519,14 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
                   Container(
                     width: 7,
                     height: 7,
-                    decoration: BoxDecoration(
-                      color: hasSensor ? AppTheme.liveGreen : Colors.white24,
+                    decoration: const BoxDecoration(
+                      color: AppTheme.liveGreen,
                       shape: BoxShape.circle,
                     ),
                   ),
                   const SizedBox(width: 6),
                   Text(
-                    hasSensor
-                        ? 'SENTRY NODE: ${sensor.name.toUpperCase()} (${sensor.ipAddress})'
-                        : 'SENTRY SENSOR NODE OFFLINE',
+                    'SENTRY NODE: ${sensor.name.toUpperCase()} (${sensor.ipAddress})',
                     style: TextStyle(
                       color: Colors.white.withValues(alpha: 0.6),
                       fontSize: 10,
@@ -395,13 +536,28 @@ class _LiveViewScreenState extends State<LiveViewScreen> {
                   ),
                 ],
               ),
-              Text(
-                hasSensor && sensor.lastHeartbeat != null ? 'SYNCED' : 'STANDBY',
-                style: const TextStyle(
-                  color: AppTheme.liveGreen,
-                  fontSize: 9,
-                  fontWeight: FontWeight.bold,
-                ),
+              Row(
+                children: [
+                  Text(
+                    sensor.lastHeartbeat != null ? 'SYNCED' : 'STANDBY',
+                    style: const TextStyle(
+                      color: AppTheme.liveGreen,
+                      fontSize: 9,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  InkWell(
+                    onTap: _isScanningSensors ? null : _scanSensors,
+                    child: _isScanningSensors
+                        ? const SizedBox(
+                            width: 10,
+                            height: 10,
+                            child: CircularProgressIndicator(strokeWidth: 1.5, color: AppTheme.cyberBlue),
+                          )
+                        : const Icon(Icons.refresh, size: 14, color: AppTheme.cyberBlue),
+                  ),
+                ],
               ),
             ],
           ),

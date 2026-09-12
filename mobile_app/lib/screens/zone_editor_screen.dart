@@ -211,6 +211,17 @@ class _ZoneEditorScreenState extends State<ZoneEditorScreen> {
       appBar: AppBar(
         title: const Text('Interactive Zone & Privacy Mask Canvas', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
         actions: [
+          if (_isLoading)
+            const Center(
+              child: Padding(
+                padding: EdgeInsets.symmetric(horizontal: 12),
+                child: SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: AppTheme.cyberBlue),
+                ),
+              ),
+            ),
           IconButton(
             tooltip: 'Sync Zones with Backend',
             icon: const Icon(Icons.cloud_upload_outlined, color: AppTheme.cyberBlue),
