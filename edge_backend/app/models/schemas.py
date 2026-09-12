@@ -153,6 +153,18 @@ SecurityEventListResponse = EventListResponse
 
 # ---------------- Cameras & WebRTC ----------------
 
+class CameraFeatureConfig(BaseModel):
+    fall_detection_enabled: bool = True
+    skeletal_tracking_enabled: bool = True
+    object_detection_enabled: bool = True
+    package_detection_enabled: bool = True
+    animal_detection_enabled: bool = True
+    vehicle_detection_enabled: bool = True
+
+    class Config:
+        from_attributes = True
+
+
 class CameraFeed(BaseModel):
     id: str
     name: str
@@ -163,6 +175,7 @@ class CameraFeed(BaseModel):
     resolution: str
     is_ai_enabled: bool
     ai_models: List[str]
+    features: Optional[CameraFeatureConfig] = Field(default_factory=CameraFeatureConfig)
     dvr_enabled: bool = True
     dvr_retention_days: int = 7
     dvr_quota_gb: float = 100.0
@@ -312,3 +325,50 @@ DeviceTokenRegistration = DeviceRegistration
 
 class MuteCameraRequest(BaseModel):
     duration_minutes: int = 5
+
+
+# ---------------- IoT Sensor Hub & Sentry Nodes ----------------
+
+class SensorConfigUpdate(BaseModel):
+    pir_enabled: Optional[bool] = True
+    ultrasonic_enabled: Optional[bool] = True
+    door1_enabled: Optional[bool] = True
+    door2_enabled: Optional[bool] = True
+    distance_threshold_cm: Optional[float] = 50.0
+
+
+class SensorTelemetry(BaseModel):
+    camera_id: Optional[str] = None
+    pir_motion: bool = False
+    distance_cm: Optional[float] = None
+    door1_open: bool = False
+    door2_open: bool = False
+    timestamp: Optional[datetime] = Field(default_factory=datetime.utcnow)
+
+
+class SensorNodeCreate(BaseModel):
+    id: Optional[str] = None
+    name: str
+    node_type: str = "ESP32_SENTRY"
+    ip_address: str
+    mac_address: Optional[str] = None
+    associated_camera_id: Optional[str] = None
+    enabled_sensors: Optional[Dict[str, Any]] = None
+    sensor_states: Optional[Dict[str, Any]] = None
+
+
+class SensorNodeResponse(BaseModel):
+    id: str
+    name: str
+    node_type: str
+    ip_address: str
+    mac_address: Optional[str] = None
+    associated_camera_id: Optional[str] = None
+    enabled_sensors: Optional[Dict[str, Any]] = None
+    sensor_states: Optional[Dict[str, Any]] = None
+    last_heartbeat: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True

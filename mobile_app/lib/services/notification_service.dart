@@ -75,10 +75,10 @@ class NotificationService {
       await AudioPlayer.global.setAudioContext(AudioContext(
         iOS: AudioContextIOS(
           category: AVAudioSessionCategory.playback,
-          options: [
+          options: {
             AVAudioSessionOptions.duckOthers,
             AVAudioSessionOptions.defaultToSpeaker,
-          ],
+          },
         ),
         android: AudioContextAndroid(
           isSpeakerphoneOn: true,

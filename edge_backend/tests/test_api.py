@@ -9,7 +9,7 @@ from sqlalchemy import select
 from app.main import app
 from app.config import settings
 from app.database import engine, async_session_factory
-from app.models.db_models import Base, SystemSetupModel, CameraModel
+from app.models.db_models import Base, SystemSetupModel, CameraModel, SensorNodeModel, SecurityEventModel
 from app.models.schemas import (
     SecurityEvent,
     EventType,
@@ -18,9 +18,14 @@ from app.models.schemas import (
     ZoneType,
     Point2D,
     TripwireDirection,
+    CameraFeatureConfig,
+    BoundingBox,
+    Keypoint,
 )
 from app.services.notification_service import notification_service
 from app.services.auth_service import auth_service, intrusion_detector
+from app.services.feature_manager import feature_manager
+from app.services.hailo_inference_service import hailo_inference_service
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -29,6 +34,11 @@ def init_test_db():
     async def _init():
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            try:
+                from sqlalchemy import text
+                await conn.execute(text("ALTER TABLE cameras ADD COLUMN features JSON;"))
+            except Exception:
+                pass
         
         async with async_session_factory() as session:
             # Mark setup completed
@@ -47,6 +57,7 @@ def init_test_db():
                     name="Living Room Camera",
                     location="Indoor",
                     rtsp_url="rtsp://127.0.0.1:554/live",
+                    webrtc_url="http://127.0.0.1:8000/api/v1/webrtc/offer?camera_id=cam_living_room",
                     dvr_enabled=True,
                     status="ONLINE"
                 ))
@@ -283,3 +294,195 @@ def test_pairing_code_flow(client):
     # 3. Subsequent pair with same code should fail (single-use)
     replay_res = client.post("/api/v1/auth/pair", json={"pairing_code": code})
     assert replay_res.status_code == 401
+
+
+def test_camera_feature_toggles_persistence(client, auth_headers):
+    # 1. Update features via PUT
+    payload = {
+        "fall_detection_enabled": False,
+        "skeletal_tracking_enabled": True,
+        "object_detection_enabled": True,
+        "package_detection_enabled": False,
+        "animal_detection_enabled": False,
+        "vehicle_detection_enabled": True,
+    }
+    res = client.put("/api/v1/cameras/cam_living_room/features", json=payload, headers=auth_headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["fall_detection_enabled"] is False
+    assert data["package_detection_enabled"] is False
+    assert data["vehicle_detection_enabled"] is True
+
+    # 2. Check feature_manager in-memory state
+    cached_cfg = feature_manager.get_features("cam_living_room")
+    assert cached_cfg.fall_detection_enabled is False
+    assert cached_cfg.package_detection_enabled is False
+
+    # 3. Fetch via GET /features
+    get_res = client.get("/api/v1/cameras/cam_living_room/features", headers=auth_headers)
+    assert get_res.status_code == 200
+    assert get_res.json()["fall_detection_enabled"] is False
+
+    # 4. Check CameraFeed includes features
+    feed_res = client.get("/api/v1/cameras/cam_living_room", headers=auth_headers)
+    assert feed_res.status_code == 200
+    assert feed_res.json()["features"]["fall_detection_enabled"] is False
+
+    # 5. Restore features
+    restore_payload = {
+        "fall_detection_enabled": True,
+        "skeletal_tracking_enabled": True,
+        "object_detection_enabled": True,
+        "package_detection_enabled": True,
+        "animal_detection_enabled": True,
+        "vehicle_detection_enabled": True,
+    }
+    client.put("/api/v1/cameras/cam_living_room/features", json=restore_payload, headers=auth_headers)
+
+
+def test_hailo_inference_service_feature_bypassing():
+    cam_id = "cam_test_bypass"
+    frame = None
+
+    # Test 1: object_detection_enabled == False bypasses detection
+    feature_manager.update_features(cam_id, CameraFeatureConfig(
+        object_detection_enabled=False,
+        skeletal_tracking_enabled=True,
+        fall_detection_enabled=True,
+    ))
+    raw_det = [BoundingBox(x_min=0.1, y_min=0.1, x_max=0.5, y_max=0.8, confidence=0.9, label="person")]
+    dets = hailo_inference_service.detect_objects(cam_id, frame, raw_detections=raw_det)
+    assert dets == []
+    events = hailo_inference_service.process_frame(cam_id, frame, simulated_detections=raw_det)
+    assert events == []
+
+    # Test 2: skeletal_tracking_enabled == False bypasses pose keypoints
+    feature_manager.update_features(cam_id, CameraFeatureConfig(
+        object_detection_enabled=True,
+        skeletal_tracking_enabled=False,
+        fall_detection_enabled=True,
+    ))
+    raw_kp = [Keypoint(id=0, name="nose", x=0.5, y=0.5, confidence=0.95)]
+    kps = hailo_inference_service.detect_pose(cam_id, frame, raw_keypoints=raw_kp)
+    assert kps == []
+
+    # Test 3: fall_detection_enabled == False bypasses kinematics state machine
+    feature_manager.update_features(cam_id, CameraFeatureConfig(
+        object_detection_enabled=True,
+        skeletal_tracking_enabled=True,
+        fall_detection_enabled=False,
+    ))
+    fall_res = hailo_inference_service.run_kinematics(cam_id, 1, raw_kp, raw_det[0])
+    assert fall_res is None
+
+
+def test_sensor_node_registration_and_listing(client, auth_headers):
+    # 1. Register ESP32 sentry node
+    reg_payload = {
+        "id": "sentry_front_porch",
+        "name": "Front Porch ESP32 Sentry",
+        "node_type": "ESP32_SENTRY",
+        "ip_address": "192.168.1.150",
+        "mac_address": "AA:BB:CC:11:22:33",
+        "associated_camera_id": "cam_living_room",
+        "enabled_sensors": {
+            "pir_enabled": True,
+            "ultrasonic_enabled": True,
+            "door1_enabled": True,
+            "door2_enabled": False,
+            "distance_threshold_cm": 40.0
+        }
+    }
+    res = client.post("/api/v1/sensors/register", json=reg_payload, headers=auth_headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["id"] == "sentry_front_porch"
+    assert data["name"] == "Front Porch ESP32 Sentry"
+    assert data["ip_address"] == "192.168.1.150"
+
+    # 2. List sensors
+    list_res = client.get("/api/v1/sensors", headers=auth_headers)
+    assert list_res.status_code == 200
+    nodes = list_res.json()
+    assert any(n["id"] == "sentry_front_porch" for n in nodes)
+
+
+def test_sensor_toggles_update(client, auth_headers):
+    # Update toggles for sentry_front_porch
+    update_payload = {
+        "pir_enabled": False,
+        "door2_enabled": True,
+        "distance_threshold_cm": 75.0
+    }
+    res = client.put("/api/v1/sensors/sentry_front_porch/toggles", json=update_payload, headers=auth_headers)
+    assert res.status_code == 200
+    data = res.json()
+    assert data["enabled_sensors"]["pir_enabled"] is False
+    assert data["enabled_sensors"]["door2_enabled"] is True
+    assert data["enabled_sensors"]["distance_threshold_cm"] == 75.0
+
+
+def test_sensor_telemetry_and_incident_clip_triggering(client, auth_headers):
+    # 1. Arm system
+    arm_res = client.post("/api/v1/sensors/arm", headers=auth_headers)
+    assert arm_res.status_code == 200
+    assert arm_res.json()["armed"] is True
+
+    # 2. Ingest normal telemetry (no alarm)
+    telemetry_normal = {
+        "camera_id": "cam_living_room",
+        "pir_motion": False,
+        "distance_cm": 150.0,
+        "door1_open": False,
+        "door2_open": False
+    }
+    res_normal = client.post("/api/v1/sensors/sentry_front_porch/telemetry", json=telemetry_normal, headers=auth_headers)
+    assert res_normal.status_code == 200
+    assert res_normal.json()["incident_triggered"] is False
+
+    # 3. Ingest door opened alarm while armed -> should trigger 15s incident clip
+    telemetry_door_alarm = {
+        "camera_id": "cam_living_room",
+        "pir_motion": False,
+        "distance_cm": 20.0,
+        "door1_open": True,
+        "door2_open": False
+    }
+    res_door = client.post("/api/v1/sensors/sentry_front_porch/telemetry", json=telemetry_door_alarm, headers=auth_headers)
+    assert res_door.status_code == 200
+    door_data = res_door.json()
+    assert door_data["incident_triggered"] is True
+    assert door_data["event_id"] is not None
+
+    # Verify event was recorded in DB
+    async def _check_event(evt_id):
+        async with async_session_factory() as session:
+            st = select(SecurityEventModel).where(SecurityEventModel.id == evt_id)
+            r = await session.execute(st)
+            return r.scalar_one_or_none()
+
+    saved_event = asyncio.run(_check_event(door_data["event_id"]))
+    assert saved_event is not None
+    assert saved_event.event_type == EventType.DOOR_LEFT_OPEN.value
+    assert saved_event.severity == EventSeverity.CRITICAL.value
+
+    # 4. Ingest PIR motion alarm while armed
+    telemetry_pir_alarm = {
+        "camera_id": "cam_living_room",
+        "pir_motion": True,
+        "door1_open": False,
+        "door2_open": False
+    }
+    res_pir = client.post("/api/v1/sensors/sentry_front_porch/telemetry", json=telemetry_pir_alarm, headers=auth_headers)
+    assert res_pir.status_code == 200
+    pir_data = res_pir.json()
+    assert pir_data["incident_triggered"] is True
+
+    # 5. Disarm system and verify no incident clip triggered on door open
+    disarm_res = client.post("/api/v1/sensors/disarm", headers=auth_headers)
+    assert disarm_res.status_code == 200
+    assert disarm_res.json()["armed"] is False
+
+    res_disarmed = client.post("/api/v1/sensors/sentry_front_porch/telemetry", json=telemetry_door_alarm, headers=auth_headers)
+    assert res_disarmed.status_code == 200
+    assert res_disarmed.json()["incident_triggered"] is False

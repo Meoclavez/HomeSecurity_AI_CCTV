@@ -60,14 +60,16 @@ Edge_AI_CCTV/
 │   │   ├── routes/
 │   │   │   ├── health.py                     # Hardware & telemetry monitoring endpoint (/api/v1/health)
 │   │   │   ├── setup.py                      # First-time setup wizard & auth pairing API (/api/v1/setup, /api/v1/auth)
-│   │   │   ├── cameras.py                    # Camera CRUD, snapshot routes, device token registration
+│   │   │   ├── cameras.py                    # Camera CRUD, snapshot routes, dynamic AI feature toggles
 │   │   │   ├── events.py                     # AI event ingestion, SQLite persistence, clip streaming
+│   │   │   ├── sensors.py                    # ESP32 IoT Sentry hub (/api/v1/sensors, telemetry, toggles, arm/disarm)
 │   │   │   ├── webrtc.py                     # WebRTC SDP offer/answer exchange & dynamic ICE servers
 │   │   │   ├── dvr.py                        # 24-Hour Timeline, dynamic HLS playlists, incident exports, storage health
 │   │   │   └── zones.py                      # Camera privacy masks, tripwires, intrusion zones & alert muting
 │   │   └── services/
+│   │       ├── feature_manager.py            # Real-time dynamic AI vision feature toggles coordinator
 │   │       ├── camera_network_manager.py     # Plug-and-Play NIC DHCP, 5-point camera diagnostics & IP migration watchdog
-│   │       ├── hailo_inference_service.py    # HailoRT PCIe (.hef) runner & kinematic fall engine
+│   │       ├── hailo_inference_service.py    # HailoRT PCIe (.hef) runner, YOLO11, and kinematic fall engine
 │   │       ├── ai_zone_service.py            # Privacy masking, tripwires, polygon PIP, state machines & scheduler
 │   │       ├── dvr_recorder.py               # 24/7 continuous zero-copy segmenter, HLS, stitcher & SMART health
 │   │       ├── video_ingest_service.py       # Threaded QuickSync VA-API frame grabber with source-level privacy masking
@@ -76,8 +78,11 @@ Edge_AI_CCTV/
 │   │       ├── turn_service.py               # RFC 5766 dynamic ephemeral TURN credentials generator
 │   │       ├── mdns_service.py               # Bonjour/Zeroconf mDNS advertiser for LAN discovery
 │   │       └── auth_service.py               # Tokenized session manager & path traversal sanitizer
+│   ├── models/
+│   │   ├── yolo11n.onnx                      # SOTA YOLO11 80-class object detection model (640x640)
+│   │   └── yolo11n-pose.onnx                 # SOTA YOLO11 17-keypoint skeletal pose estimation model
 │   ├── tests/
-│   │   ├── test_api.py                       # REST API, auth, ICE, zones, timeline & storage tests
+│   │   ├── test_api.py                       # REST API, auth, ICE, zones, timeline, sensors & feature toggle tests
 │   │   └── test_kinematics.py                # Kinematics, polygon ray-casting & tripwire crossing unit tests
 │   ├── coturn/coturn.conf                    # Coturn TURN/STUN relay configuration (RFC 5766)
 │   ├── Caddyfile                             # Caddy reverse proxy config (TLS termination for HTTPS/WSS)

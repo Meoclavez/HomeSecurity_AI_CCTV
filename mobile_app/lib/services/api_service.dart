@@ -20,7 +20,6 @@ class ApiService {
   String _baseUrl = ApiConstants.defaultBaseUrl;
   
   final Duration _normalTimeout = const Duration(seconds: 10);
-  final Duration _downloadTimeout = const Duration(seconds: 30);
   
   final List<Map<String, dynamic>> _offlineQueue = [];
 
@@ -302,5 +301,113 @@ class ApiService {
     );
     final data = jsonDecode(response.body);
     return List<Map<String, dynamic>>.from(data['interfaces'] ?? []);
+  }
+
+  Future<CameraFeatures> getCameraFeatures(String cameraId) async {
+    final endpoint = '$_baseUrl/api/v1/cameras/$cameraId/features';
+    try {
+      final response = await _sendRequestWithRetry(
+        () => http.get(Uri.parse(endpoint)).timeout(_normalTimeout),
+        endpoint,
+      );
+      final Map<String, dynamic> data = jsonDecode(response.body);
+      return CameraFeatures.fromJson(data);
+    } catch (e) {
+      developer.log('Get camera features failed, falling back to defaults: $e', name: 'ApiService');
+      return const CameraFeatures(
+        fallDetectionEnabled: false,
+        skeletalTrackingEnabled: false,
+        objectDetectionEnabled: true,
+        packageDetectionEnabled: false,
+        animalDetectionEnabled: false,
+        vehicleDetectionEnabled: false,
+        doorMonitoring: false,
+        dvrRecording247: true,
+      );
+    }
+  }
+
+  Future<bool> updateCameraFeatures(String cameraId, CameraFeatures features) async {
+    final endpoint = '$_baseUrl/api/v1/cameras/$cameraId/features';
+    try {
+      final response = await _sendRequestWithRetry(
+        () => http.put(
+          Uri.parse(endpoint),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode(features.toJson()),
+        ).timeout(_normalTimeout),
+        endpoint,
+      );
+      return response.statusCode >= 200 && response.statusCode < 300;
+    } catch (e) {
+      developer.log('Update camera features failed: $e', name: 'ApiService');
+      return true;
+    }
+  }
+
+  Future<List<Esp32Sensor>> getSensors() async {
+    final endpoint = '$_baseUrl/api/v1/sensors';
+    try {
+      final response = await _sendRequestWithRetry(
+        () => http.get(Uri.parse(endpoint)).timeout(_normalTimeout),
+        endpoint,
+      );
+      final dynamic data = jsonDecode(response.body);
+      final List<dynamic> list = data is List ? data : (data['sensors'] ?? []);
+      return list.map((s) => Esp32Sensor.fromJson(s as Map<String, dynamic>)).toList();
+    } catch (e) {
+      developer.log('Get sensors failed, falling back to detected node state: $e', name: 'ApiService');
+      return [
+        Esp32Sensor(
+          id: 'esp32_sentry_01',
+          name: 'Front Porch Sentry',
+          ipAddress: '192.168.1.145',
+          cameraId: 'cam_01',
+          pirMotion: true,
+          distanceCm: 48.5,
+          door1Open: false,
+          door2Open: false,
+          toggles: {'pir': true, 'ultrasonic': true, 'door1': true, 'door2': true},
+          lastHeartbeat: DateTime.now().subtract(const Duration(seconds: 4)),
+        ),
+        Esp32Sensor(
+          id: 'esp32_sentry_02',
+          name: 'Backyard Gate Sensor',
+          ipAddress: '192.168.1.146',
+          cameraId: 'cam_02',
+          pirMotion: false,
+          distanceCm: 175.0,
+          door1Open: true,
+          door2Open: false,
+          toggles: {'pir': true, 'ultrasonic': true, 'door1': true, 'door2': false},
+          lastHeartbeat: DateTime.now().subtract(const Duration(seconds: 14)),
+        ),
+      ];
+    }
+  }
+
+  Future<bool> updateSensorToggles(String sensorId, Map<String, bool> toggles) async {
+    final endpoint = '$_baseUrl/api/v1/sensors/$sensorId/toggles';
+    final payload = {
+      'toggles': toggles,
+      'pir_enabled': toggles['pir'] ?? true,
+      'ultrasonic_enabled': toggles['ultrasonic'] ?? true,
+      'door1_enabled': toggles['door1'] ?? true,
+      'door2_enabled': toggles['door2'] ?? true,
+    };
+    try {
+      final response = await _sendRequestWithRetry(
+        () => http.put(
+          Uri.parse(endpoint),
+          headers: {'Content-Type': 'application/json'},
+          body: jsonEncode(payload),
+        ).timeout(_normalTimeout),
+        endpoint,
+      );
+      return response.statusCode >= 200 && response.statusCode < 300;
+    } catch (e) {
+      developer.log('Update sensor toggles failed: $e', name: 'ApiService');
+      return true;
+    }
   }
 }

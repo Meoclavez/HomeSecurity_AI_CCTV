@@ -10,9 +10,16 @@ from sqlalchemy import select
 from app.config import settings
 from app.database import get_db
 from app.models.db_models import CameraModel
-from app.models.schemas import CameraFeed, CameraListResponse, CameraStatus, DeviceTokenRegistration
+from app.models.schemas import (
+    CameraFeed,
+    CameraListResponse,
+    CameraStatus,
+    DeviceTokenRegistration,
+    CameraFeatureConfig,
+)
 from app.services.video_ingest_service import video_ingest_service
 from app.services.notification_service import notification_service
+from app.services.feature_manager import feature_manager
 
 from app.services.auth_service import auth_service, general_rate_limiter
 from app.routes import ResilientRoute
@@ -44,6 +51,7 @@ async def list_cameras(db: AsyncSession = Depends(get_db)):
             resolution=c.resolution,
             is_ai_enabled=c.is_ai_enabled,
             ai_models=c.ai_models or [],
+            features=CameraFeatureConfig(**c.features) if c.features else feature_manager.get_features(c.id),
             last_seen=c.last_seen
         )
         for c in db_cameras
@@ -71,8 +79,50 @@ async def get_camera(camera_id: str, db: AsyncSession = Depends(get_db)):
         resolution=cam.resolution,
         is_ai_enabled=cam.is_ai_enabled,
         ai_models=cam.ai_models or [],
+        features=CameraFeatureConfig(**cam.features) if cam.features else feature_manager.get_features(cam.id),
         last_seen=cam.last_seen
     )
+
+
+@router.put("/{camera_id}/features", response_model=CameraFeatureConfig)
+async def update_camera_features(
+    camera_id: str,
+    features: CameraFeatureConfig,
+    db: AsyncSession = Depends(get_db)
+):
+    """Update AI feature flags for a camera, sync with feature_manager, and persist to SQLite DB."""
+    stmt = select(CameraModel).where(CameraModel.id == camera_id)
+    res = await db.execute(stmt)
+    cam = res.scalar_one_or_none()
+    if not cam:
+        raise HTTPException(status_code=404, detail=f"Camera {camera_id} not found")
+
+    # Update in-memory feature_manager
+    feature_manager.update_features(camera_id, features)
+
+    # Persist in DB
+    cam.features = features.dict()
+    await db.commit()
+    await db.refresh(cam)
+
+    return features
+
+
+@router.get("/{camera_id}/features", response_model=CameraFeatureConfig)
+async def get_camera_features(
+    camera_id: str,
+    db: AsyncSession = Depends(get_db)
+):
+    """Retrieve AI feature flags for a camera."""
+    stmt = select(CameraModel).where(CameraModel.id == camera_id)
+    res = await db.execute(stmt)
+    cam = res.scalar_one_or_none()
+    if not cam:
+        raise HTTPException(status_code=404, detail=f"Camera {camera_id} not found")
+
+    if cam.features:
+        return CameraFeatureConfig(**cam.features)
+    return feature_manager.get_features(camera_id)
 
 
 @router.get("/{camera_id}/snapshot")

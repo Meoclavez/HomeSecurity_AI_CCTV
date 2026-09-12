@@ -11,12 +11,14 @@ from sqlalchemy import select
 from app.config import settings
 from app.database import engine, async_session_factory
 from app.models.db_models import Base, CameraModel
-from app.routes import cameras, events, webrtc, health, dvr, zones, setup
+from app.models.schemas import CameraFeatureConfig
+from app.routes import cameras, events, webrtc, health, dvr, zones, setup, sensors
 from app.services.video_ingest_service import video_ingest_service
 from app.services.clip_recorder import StorageCleaner
 from app.services.dvr_recorder import dvr_recorder_service
 from app.services.mdns_service import mdns_advertiser
 from app.services.resilience import setup_structured_logging, ServiceHealthTracker
+from app.services.feature_manager import feature_manager
 
 # Setup structured JSON logging with rotating file handler
 setup_structured_logging()
@@ -102,6 +104,11 @@ async def lifespan(app: FastAPI):
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+            try:
+                from sqlalchemy import text
+                await conn.execute(text("ALTER TABLE cameras ADD COLUMN features JSON;"))
+            except Exception:
+                pass  # Column already exists
         health_tracker.record_success("database")
     except Exception as e:
         logger.error(f"Database schema initialization failed: {e}")
@@ -123,7 +130,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Failed to check setup status: {e}")
 
-    # 2. Seed default cameras if table is empty
+    # 2. Seed default cameras if table is empty, and sync feature_manager
     try:
         async with async_session_factory() as session:
             stmt = select(CameraModel)
@@ -134,6 +141,12 @@ async def lifespan(app: FastAPI):
                 for c_data in DEFAULT_CAMERAS:
                     session.add(CameraModel(**c_data))
                 await session.commit()
+                res = await session.execute(stmt)
+                existing = res.scalars().all()
+
+            for cam in existing:
+                if cam.features:
+                    feature_manager.update_features(cam.id, CameraFeatureConfig(**cam.features))
     except Exception as e:
         logger.error(f"Failed to seed default cameras: {e}")
 
@@ -295,6 +308,7 @@ app.include_router(events.router)
 app.include_router(webrtc.router)
 app.include_router(dvr.router)
 app.include_router(zones.router)
+app.include_router(sensors.router, prefix="/api/v1/sensors", tags=["Sensors"])
 
 
 @app.get("/")

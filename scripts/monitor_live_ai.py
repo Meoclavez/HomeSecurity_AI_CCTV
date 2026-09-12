@@ -90,6 +90,27 @@ class DetectionObject:
     confidence: float
     class_id: int
     class_name: str
+    keypoints: Optional[List[Tuple[float, float, float]]] = None  # 17 keypoints: (norm_x, norm_y, conf)
+
+
+# 17 COCO Keypoints & Skeleton Limb Graph
+COCO_KEYPOINTS = [
+    "nose", "left_eye", "right_eye", "left_ear", "right_ear",
+    "left_shoulder", "right_shoulder", "left_elbow", "right_elbow",
+    "left_wrist", "right_wrist", "left_hip", "right_hip",
+    "left_knee", "right_knee", "left_ankle", "right_ankle"
+]
+
+COCO_SKELETON = [
+    (0, 1), (0, 2), (1, 3), (2, 4),      # Face / Ears
+    (5, 6),                              # Shoulders
+    (5, 7), (7, 9),                      # Left arm
+    (6, 8), (8, 10),                     # Right arm
+    (5, 11), (6, 12),                    # Torso sides
+    (11, 12),                            # Pelvis / Hips
+    (11, 13), (13, 15),                  # Left leg
+    (12, 14), (14, 16)                   # Right leg
+]
 
 
 # ==============================================================================
@@ -156,28 +177,62 @@ class ZoneAlertDebouncer:
 # ==============================================================================
 # Multi-Class Deep Learning Detector with Insect & Noise Filter
 # ==============================================================================
+def find_onnx_model(candidates: List[str]) -> Optional[str]:
+    search_dirs = [
+        PROJECT_ROOT / "edge_backend" / "models",
+        PROJECT_ROOT / "models",
+        PROJECT_ROOT / "scripts",
+        PROJECT_ROOT,
+        Path("edge_backend/models"),
+        Path("models"),
+        Path(".")
+    ]
+    for cand in candidates:
+        for s_dir in search_dirs:
+            p = s_dir / cand
+            if p.exists() and p.is_file():
+                return str(p.resolve())
+    return None
+
+
 class UnifiedPersonDetector:
-    """Full 80-Class Deep Neural Network Detector with Physical Dimension Gating."""
+    """Full 80-Class Deep Neural Network Detector & 17-Keypoint Pose Estimator with Physical Dimension Gating."""
 
-    def __init__(self, onnx_model_path: Optional[str] = None):
+    def __init__(self, onnx_model_path: Optional[str] = None, pose_model_path: Optional[str] = None):
         if onnx_model_path is None:
-            default_path = PROJECT_ROOT / "edge_backend" / "models" / "yolov5n.onnx"
-            if default_path.exists():
-                onnx_model_path = str(default_path)
+            onnx_model_path = find_onnx_model(["yolo11n.onnx", "yolov8n.onnx", "yolov5n.onnx"])
 
+        if pose_model_path is None:
+            pose_model_path = find_onnx_model(["yolo11n-pose.onnx", "yolov8n-pose.onnx"])
+
+        self.model_path = onnx_model_path
+        self.pose_model_path = pose_model_path
         self.net = None
+        self.pose_net = None
         self.use_dnn = False
+        self.use_pose_dnn = False
 
-        if onnx_model_path and os.path.exists(onnx_model_path):
+        if self.model_path and os.path.exists(self.model_path):
             try:
-                self.net = cv2.dnn.readNetFromONNX(onnx_model_path)
+                self.net = cv2.dnn.readNetFromONNX(self.model_path)
                 self.net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
                 self.net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
                 self.use_dnn = True
-                logger.info(f"✅ OpenCV Deep Neural Network loaded: {onnx_model_path}")
+                logger.info(f"✅ Primary YOLO Detection Model loaded: {self.model_path}")
             except Exception as e:
-                logger.warning(f"[-] Could not load ONNX model ({e}). Using Morphological Body Merger.")
+                logger.warning(f"[-] Could not load detection model ({e}). Using Morphological Body Merger.")
                 self.use_dnn = False
+
+        if self.pose_model_path and os.path.exists(self.pose_model_path):
+            try:
+                self.pose_net = cv2.dnn.readNetFromONNX(self.pose_model_path)
+                self.pose_net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+                self.pose_net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+                self.use_pose_dnn = True
+                logger.info(f"✅ YOLO Pose Estimation Model loaded: {self.pose_model_path}")
+            except Exception as e:
+                logger.warning(f"[-] Could not load pose model ({e}). Fallback to kinematic skeletal estimation.")
+                self.use_pose_dnn = False
 
         self.bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=300, varThreshold=24, detectShadows=False)
         self.vertical_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (15, 45))
@@ -201,28 +256,44 @@ class UnifiedPersonDetector:
         img = cv2.copyMakeBorder(img, top, bottom, left, right, cv2.BORDER_CONSTANT, value=color)
         return img, r, (dw, dh)
 
-    def detect(self, frame: np.ndarray) -> List[DetectionObject]:
+    def detect(self, frame: np.ndarray, skeletal_tracking_enabled: bool = True) -> List[DetectionObject]:
         h, w = frame.shape[:2]
         if self.use_dnn and self.net is not None:
             try:
-                return self._detect_dnn(frame, w, h)
+                return self._detect_dnn(frame, w, h, skeletal_tracking_enabled=skeletal_tracking_enabled)
             except Exception as e:
                 logger.warning(f"DNN inference error ({e}), falling back to morphological.")
-        return self._detect_morphological_merged(frame, w, h)
+        return self._detect_morphological_merged(frame, w, h, skeletal_tracking_enabled=skeletal_tracking_enabled)
 
-    def _detect_dnn(self, frame: np.ndarray, w: int, h: int) -> List[DetectionObject]:
+    def _detect_dnn(
+        self,
+        frame: np.ndarray,
+        w: int,
+        h: int,
+        skeletal_tracking_enabled: bool = True
+    ) -> List[DetectionObject]:
         letterbox_img, ratio, (dw, dh) = self._letterbox(frame, (640, 640))
         blob = cv2.dnn.blobFromImage(letterbox_img, 1.0 / 255.0, (640, 640), (0, 0, 0), swapRB=True, crop=False)
         self.net.setInput(blob)
         preds = self.net.forward()
 
+        # Handle 3D / 2D output shapes: [1, 84, 8400], [1, 56, 8400], [1, 8400, 84], [1, 25200, 85]
         if len(preds.shape) == 3:
-            preds = np.transpose(preds[0], (1, 0)) if preds.shape[1] < preds.shape[2] else preds[0]
+            if preds.shape[1] < preds.shape[2]:
+                preds = np.transpose(preds[0], (1, 0))  # Shape becomes [N, C]
+            else:
+                preds = preds[0]
+        elif len(preds.shape) == 2:
+            if preds.shape[0] < preds.shape[1]:
+                preds = np.transpose(preds, (1, 0))
 
-        boxes, confidences, class_ids, class_names = [], [], [], []
+        boxes, confidences, class_ids, class_names, keypoints_list = [], [], [], [], []
+        num_cols = preds.shape[1]
 
         for row in preds:
-            if preds.shape[1] == 85:  # YOLOv5 format [cx, cy, w, h, obj_conf, p0...p79]
+            kp_row = None
+            if num_cols == 85:
+                # YOLOv5 format [cx, cy, w, h, obj_conf, p0...p79]
                 obj_conf = float(row[4])
                 if obj_conf < 0.25:
                     continue
@@ -230,8 +301,24 @@ class UnifiedPersonDetector:
                 best_class_idx = int(np.argmax(class_scores))
                 class_score = float(class_scores[best_class_idx])
                 final_conf = obj_conf * class_score
-            else:  # YOLOv8 format [cx, cy, w, h, p0...p79]
-                class_scores = row[4:]
+            elif num_cols == 56:
+                # YOLO11 / YOLOv8 Pose format [cx, cy, w, h, person_conf, 17*(x, y, conf)]
+                final_conf = float(row[4])
+                best_class_idx = 0  # COCO Person class
+                if skeletal_tracking_enabled and final_conf >= 0.30:
+                    kp_row = []
+                    for k in range(17):
+                        k_x = (float(row[5 + k * 3]) - dw) / ratio
+                        k_y = (float(row[5 + k * 3 + 1]) - dh) / ratio
+                        k_c = float(row[5 + k * 3 + 2])
+                        kp_row.append((
+                            max(0.0, min(1.0, k_x / w)),
+                            max(0.0, min(1.0, k_y / h)),
+                            k_c
+                        ))
+            else:
+                # YOLO11 / YOLOv8 Detect format [cx, cy, w, h, p0...p79] (84 columns)
+                class_scores = row[4:84]
                 best_class_idx = int(np.argmax(class_scores))
                 final_conf = float(class_scores[best_class_idx])
 
@@ -264,6 +351,7 @@ class UnifiedPersonDetector:
                 confidences.append(final_conf)
                 class_ids.append(best_class_idx)
                 class_names.append(semantic_class)
+                keypoints_list.append(kp_row)
 
         indices = cv2.dnn.NMSBoxes(boxes, confidences, 0.30, 0.45)
         results = []
@@ -271,20 +359,142 @@ class UnifiedPersonDetector:
             flat_indices = indices.flatten() if hasattr(indices, "flatten") else [idx[0] if isinstance(idx, (list, tuple)) else idx for idx in indices]
             for idx in flat_indices:
                 bx, by, bw_px, bh_px = boxes[idx]
+                norm_x1 = max(0.0, bx / w)
+                norm_y1 = max(0.0, by / h)
+                norm_x2 = min(1.0, (bx + bw_px) / w)
+                norm_y2 = min(1.0, (by + bh_px) / h)
+                s_class = class_names[idx]
+                kp = keypoints_list[idx]
+
+                if s_class == "person" and skeletal_tracking_enabled and kp is None:
+                    kp = self._estimate_skeletal_keypoints((norm_x1, norm_y1, norm_x2, norm_y2))
+
                 results.append(DetectionObject(
-                    bbox=(
-                        max(0.0, bx / w),
-                        max(0.0, by / h),
-                        min(1.0, (bx + bw_px) / w),
-                        min(1.0, (by + bh_px) / h)
-                    ),
+                    bbox=(norm_x1, norm_y1, norm_x2, norm_y2),
                     confidence=confidences[idx],
                     class_id=class_ids[idx],
-                    class_name=class_names[idx]
+                    class_name=s_class,
+                    keypoints=kp if skeletal_tracking_enabled else None
                 ))
+
+        if skeletal_tracking_enabled and self.use_pose_dnn and self.pose_net is not None:
+            results = self._attach_pose_model_keypoints(blob, results, w, h, ratio, dw, dh)
+
         return results
 
-    def _detect_morphological_merged(self, frame: np.ndarray, w: int, h: int) -> List[DetectionObject]:
+    def _attach_pose_model_keypoints(
+        self,
+        blob: np.ndarray,
+        detections: List[DetectionObject],
+        w: int,
+        h: int,
+        ratio: float,
+        dw: float,
+        dh: float
+    ) -> List[DetectionObject]:
+        try:
+            self.pose_net.setInput(blob)
+            p_preds = self.pose_net.forward()
+            if len(p_preds.shape) == 3:
+                if p_preds.shape[1] < p_preds.shape[2]:
+                    p_preds = np.transpose(p_preds[0], (1, 0))
+                else:
+                    p_preds = p_preds[0]
+            elif len(p_preds.shape) == 2:
+                if p_preds.shape[0] < p_preds.shape[1]:
+                    p_preds = np.transpose(p_preds, (1, 0))
+
+            pose_candidates = []
+            for row in p_preds:
+                p_conf = float(row[4])
+                if p_conf < 0.35:
+                    continue
+                cx, cy, bw, bh = row[0], row[1], row[2], row[3]
+                cx = (cx - dw) / ratio
+                cy = (cy - dh) / ratio
+                bw = bw / ratio
+                bh = bh / ratio
+                norm_box = (
+                    max(0.0, (cx - bw / 2) / w),
+                    max(0.0, (cy - bh / 2) / h),
+                    min(1.0, (cx + bw / 2) / w),
+                    min(1.0, (cy + bh / 2) / h)
+                )
+                kps = []
+                for k in range(17):
+                    kx = (float(row[5 + k * 3]) - dw) / ratio
+                    ky = (float(row[5 + k * 3 + 1]) - dh) / ratio
+                    kc = float(row[5 + k * 3 + 2])
+                    kps.append((
+                        max(0.0, min(1.0, kx / w)),
+                        max(0.0, min(1.0, ky / h)),
+                        kc
+                    ))
+                pose_candidates.append((norm_box, p_conf, kps))
+
+            for det in detections:
+                if det.class_name == "person" and pose_candidates:
+                    best_iou = 0.0
+                    best_kps = None
+                    for pbox, pconf, pkps in pose_candidates:
+                        xA = max(det.bbox[0], pbox[0])
+                        yA = max(det.bbox[1], pbox[1])
+                        xB = min(det.bbox[2], pbox[2])
+                        yB = min(det.bbox[3], pbox[3])
+                        inter = max(0.0, xB - xA) * max(0.0, yB - yA)
+                        areaA = (det.bbox[2] - det.bbox[0]) * (det.bbox[3] - det.bbox[1])
+                        areaB = (pbox[2] - pbox[0]) * (pbox[3] - pbox[1])
+                        iou = inter / max(1e-6, areaA + areaB - inter)
+                        if iou > best_iou:
+                            best_iou = iou
+                            best_kps = pkps
+                    if best_iou > 0.20 and best_kps is not None:
+                        det.keypoints = best_kps
+        except Exception as e:
+            logger.debug(f"Pose DNN pass error: {e}")
+        return detections
+
+    @staticmethod
+    def _estimate_skeletal_keypoints(bbox: Tuple[float, float, float, float]) -> List[Tuple[float, float, float]]:
+        x1, y1, x2, y2 = bbox
+        bw = max(0.01, x2 - x1)
+        bh = max(0.01, y2 - y1)
+        cx = (x1 + x2) / 2.0
+
+        # 17 keypoints: nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles
+        nose = (cx, y1 + bh * 0.10, 0.90)
+        l_eye = (cx - bw * 0.08, y1 + bh * 0.08, 0.88)
+        r_eye = (cx + bw * 0.08, y1 + bh * 0.08, 0.88)
+        l_ear = (cx - bw * 0.16, y1 + bh * 0.09, 0.85)
+        r_ear = (cx + bw * 0.16, y1 + bh * 0.09, 0.85)
+
+        l_sh = (cx - bw * 0.28, y1 + bh * 0.22, 0.92)
+        r_sh = (cx + bw * 0.28, y1 + bh * 0.22, 0.92)
+
+        l_el = (cx - bw * 0.38, y1 + bh * 0.42, 0.88)
+        r_el = (cx + bw * 0.38, y1 + bh * 0.42, 0.88)
+
+        l_wr = (cx - bw * 0.32, y1 + bh * 0.60, 0.86)
+        r_wr = (cx + bw * 0.32, y1 + bh * 0.60, 0.86)
+
+        l_hip = (cx - bw * 0.18, y1 + bh * 0.56, 0.90)
+        r_hip = (cx + bw * 0.18, y1 + bh * 0.56, 0.90)
+
+        l_knee = (cx - bw * 0.20, y1 + bh * 0.76, 0.88)
+        r_knee = (cx + bw * 0.20, y1 + bh * 0.76, 0.88)
+
+        l_ankle = (cx - bw * 0.22, y1 + bh * 0.96, 0.86)
+        r_ankle = (cx + bw * 0.22, y1 + bh * 0.96, 0.86)
+
+        return [nose, l_eye, r_eye, l_ear, r_ear, l_sh, r_sh, l_el, r_el, l_wr, r_wr, l_hip, r_hip, l_knee, r_knee, l_ankle, r_ankle]
+
+    def _detect_morphological_merged(
+        self,
+        frame: np.ndarray,
+        w: int,
+        h: int,
+        skeletal_tracking_enabled: bool = True
+    ) -> List[DetectionObject]:
         scale = 480.0 / max(h, w)
         sw, sh = int(w * scale), int(h * scale)
         small = cv2.resize(frame, (sw, sh))
@@ -313,11 +523,13 @@ class UnifiedPersonDetector:
             box_w = norm_x2 - norm_x1
 
             if box_h >= 0.15 and (box_h * box_w) >= 0.025:
+                kp = self._estimate_skeletal_keypoints((norm_x1, norm_y1, norm_x2, norm_y2)) if skeletal_tracking_enabled else None
                 results.append(DetectionObject(
                     bbox=(norm_x1, norm_y1, norm_x2, norm_y2),
                     confidence=0.88,
                     class_id=0,
-                    class_name="person"
+                    class_name="person",
+                    keypoints=kp
                 ))
         return results
 
@@ -384,6 +596,7 @@ class KinematicPersonTracker:
         self.bbox = det.bbox
         self.class_name = det.class_name
         self.confidence = det.confidence
+        self.keypoints = det.keypoints
         self.state = KinematicState.STANDING
         self.motion_state = MotionState.ACTIVE_MOVING
         self.last_seen = time.time()
@@ -404,10 +617,12 @@ class KinematicPersonTracker:
         self.torso_angle = 85.0
         self.alert_dispatched = False
 
-    def update(self, det: DetectionObject, now: float):
+    def update(self, det: DetectionObject, now: float, fall_detection_enabled: bool = True):
         self.bbox = det.bbox
         self.class_name = det.class_name
         self.confidence = det.confidence
+        if det.keypoints is not None:
+            self.keypoints = det.keypoints
         self.last_seen = now
         self.hits += 1
 
@@ -457,8 +672,12 @@ class KinematicPersonTracker:
             self.stationary_duration = 0.0
             self.motion_state = MotionState.ACTIVE_MOVING
 
-        if self.class_name == "person":
+        if self.class_name == "person" and fall_detection_enabled:
             self._evaluate_state_transitions(now)
+        elif not fall_detection_enabled:
+            self.state = KinematicState.STANDING
+            self.alert_dispatched = False
+            self.descent_velocity = 0.0
 
     def _evaluate_state_transitions(self, now: float):
         if self.smoothed_ar > 1.20 and self.torso_angle > 52.0:
@@ -605,15 +824,37 @@ class CameraScanner:
 # Live AI Monitor Engine
 # ==============================================================================
 class LiveAIMonitor:
-    def __init__(self, initial_stream: Optional[str] = None):
+    def __init__(
+        self,
+        initial_stream: Optional[str] = None,
+        model_path: Optional[str] = None,
+        pose_model_path: Optional[str] = None
+    ):
         self.stream_source = initial_stream
         self.camera_id = "cam_live_eval"
         self.is_running = True
         self.cap: Optional[cv2.VideoCapture] = None
         self.current_source_name = "Detecting..."
 
-        self.detector = UnifiedPersonDetector()
+        self.detector = UnifiedPersonDetector(onnx_model_path=model_path, pose_model_path=pose_model_path)
         self.debouncer = ZoneAlertDebouncer(cooldown_seconds=3.0)
+
+        # Dynamic Runtime Feature Toggles & ESP32 Telemetry
+        self.feature_toggles = {
+            "fall_detection": True,
+            "skeletal_tracking": True,
+            "object_detection": True,
+            "esp32_pir": True,
+            "esp32_ultrasonic": True,
+            "esp32_door1": True,
+            "esp32_door2": True
+        }
+        self.esp32_sensor_readings = {
+            "pir_motion": False,
+            "distance_cm": 0.0,
+            "door1_open": False,
+            "door2_open": False
+        }
 
         self.tracks: Dict[int, KinematicPersonTracker] = {}
         self.next_track_id = 1
@@ -999,6 +1240,7 @@ class LiveAIMonitor:
     def update_tracks(self, detections: List[DetectionObject]):
         now = time.time()
         updated_tracks = set()
+        fall_enabled = self.feature_toggles.get("fall_detection", True)
 
         # 1. Filter out any detections that fall inside Exclusion / Privacy Masks
         valid_detections = []
@@ -1041,7 +1283,7 @@ class LiveAIMonitor:
                 self.next_track_id += 1
                 self.tracks[best_track_id] = KinematicPersonTracker(best_track_id, det)
 
-            self.tracks[best_track_id].update(det, now)
+            self.tracks[best_track_id].update(det, now, fall_detection_enabled=fall_enabled)
             updated_tracks.add(best_track_id)
 
         stale_ids = [tid for tid, t in self.tracks.items() if now - t.last_seen > 2.5]
@@ -1055,11 +1297,11 @@ class LiveAIMonitor:
             primary = active_humans[0]
             self.torso_angle = primary.torso_angle
             self.aspect_ratio = primary.smoothed_ar
-            self.descent_velocity = primary.descent_velocity
+            self.descent_velocity = primary.descent_velocity if fall_enabled else 0.0
             self.floor_proximity = min(1.0, primary.bbox[3])
-            self.is_fall_active = (primary.state in (KinematicState.COLLAPSED, KinematicState.IMMOBILE, KinematicState.FALL_CONFIRMED))
+            self.is_fall_active = (primary.state in (KinematicState.COLLAPSED, KinematicState.IMMOBILE, KinematicState.FALL_CONFIRMED)) if fall_enabled else False
 
-            if primary.state == KinematicState.FALL_CONFIRMED and not primary.alert_dispatched:
+            if fall_enabled and primary.state == KinematicState.FALL_CONFIRMED and not primary.alert_dispatched:
                 primary.alert_dispatched = True
                 self.trigger_alert(
                     f"CRITICAL FALL CONFIRMED! Torso={primary.torso_angle:.1f}°, Vy={primary.descent_velocity:.2f}m/s, AR={primary.smoothed_ar:.2f}",
@@ -1143,7 +1385,8 @@ class LiveAIMonitor:
             cv2.putText(hud, f"🛑 {name} {'[BREACHED!]' if self.is_intrusion_active else '[ARMED]'}",
                         (pts[0][0] + 8, pts[0][1] + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, zone_color, 2)
 
-        # 4. Render Multi-Class Color-Coded Bounding Boxes
+        # 4. Render Multi-Class Color-Coded Bounding Boxes & Skeletal Overlays
+        skeletal_enabled = self.feature_toggles.get("skeletal_tracking", True)
         for tid, t in self.tracks.items():
             if not t.is_confirmed:
                 continue
@@ -1161,6 +1404,28 @@ class LiveAIMonitor:
                 else:
                     box_color = CLASS_COLORS["person"]
                 label = f"ID:{tid} Person | {t.state.value} | θ:{t.torso_angle:.0f}° | AR:{t.smoothed_ar:.2f}"
+
+                # Render Skeletal Joint Connections (17 Keypoints)
+                if skeletal_enabled and hasattr(t, "keypoints") and t.keypoints:
+                    kp = t.keypoints
+                    # Draw skeletal limbs
+                    for (i1, i2) in COCO_SKELETON:
+                        if i1 < len(kp) and i2 < len(kp):
+                            x1, y1, c1 = kp[i1]
+                            x2, y2, c2 = kp[i2]
+                            if c1 >= 0.25 and c2 >= 0.25:
+                                pt1 = (int(x1 * w), int(y1 * h))
+                                pt2 = (int(x2 * w), int(y2 * h))
+                                limb_col = (0, 255, 180) if not self.is_fall_active else (0, 160, 255)
+                                cv2.line(hud, pt1, pt2, limb_col, 2, cv2.LINE_AA)
+
+                    # Draw joint nodes
+                    for (kx, ky, kc) in kp:
+                        if kc >= 0.25:
+                            jpt = (int(kx * w), int(ky * h))
+                            cv2.circle(hud, jpt, 4, (0, 240, 255), -1, cv2.LINE_AA)
+                            cv2.circle(hud, jpt, 5, (15, 20, 30), 1, cv2.LINE_AA)
+
             elif t.class_name == "vehicle":
                 box_color = CLASS_COLORS["vehicle"]
                 label = f"ID:{tid} Vehicle ({t.confidence:.2f})"
@@ -1189,7 +1454,9 @@ class LiveAIMonitor:
 
         cv2.putText(hud, "🛡️ EDGE AI CCTV - MULTI-ZONE STUDIO", (16, 26),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 240, 255), 2)
-        cv2.putText(hud, f"Source: {self.current_source_name} | Humans: {self.person_count} | Tripwires: {len(self.tripwires)} | Zones: {len(self.intrusion_zones)}", (16, 46),
+        
+        toggles_info = f"Fall:{'ON' if self.feature_toggles.get('fall_detection') else 'OFF'} | Skt:{'ON' if skeletal_enabled else 'OFF'} | Det:{'ON' if self.feature_toggles.get('object_detection') else 'OFF'}"
+        cv2.putText(hud, f"Source: {self.current_source_name} | Humans: {self.person_count} | {toggles_info}", (16, 46),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 180, 200), 1)
 
         fps_text = f"FPS: {self.fps:.1f} | Latency: {self.avg_inference_ms:.1f}ms | Res: {w}x{h}"
@@ -1204,33 +1471,77 @@ class LiveAIMonitor:
             cv2.putText(hud, rec_text, (w - 308, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 2)
 
         # 7. Kinematic Telemetry HUD (Bottom Left)
-        kin_w, kin_h = 330, 132
+        kin_w, kin_h = 330, 136
         kx, ky = 16, h - kin_h - 16
         overlay = hud.copy()
         cv2.rectangle(overlay, (kx, ky), (kx + kin_w, ky + kin_h), (12, 16, 24), -1)
         cv2.addWeighted(overlay, 0.85, hud, 0.15, 0, hud)
-        border_color = (0, 0, 255) if self.is_fall_active else (0, 200, 255)
+        
+        fall_active_mode = self.feature_toggles.get("fall_detection", True)
+        border_color = (0, 0, 255) if (self.is_fall_active and fall_active_mode) else (0, 200, 255)
         cv2.rectangle(hud, (kx, ky), (kx + kin_w, ky + kin_h), border_color, 1)
 
-        cv2.putText(hud, "LIVE KINEMATIC POSE TELEMETRY", (kx + 10, ky + 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, border_color, 1)
+        cv2.putText(hud, f"LIVE KINEMATICS {'[ACTIVE]' if fall_active_mode else '[DISABLED]'}",
+                    (kx + 10, ky + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.48, border_color, 1)
 
-        angle_color = (0, 0, 255) if self.torso_angle < 35 else (0, 255, 180)
-        cv2.putText(hud, f"• Torso Angle (θ): {self.torso_angle:.1f}° {'(CRITICAL)' if self.torso_angle < 35 else '(NORMAL)'}",
-                    (kx + 10, ky + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.42, angle_color, 1)
+        if fall_active_mode:
+            angle_color = (0, 0, 255) if self.torso_angle < 35 else (0, 255, 180)
+            cv2.putText(hud, f"• Torso Angle (θ): {self.torso_angle:.1f}° {'(CRITICAL)' if self.torso_angle < 35 else '(NORMAL)'}",
+                        (kx + 10, ky + 45), cv2.FONT_HERSHEY_SIMPLEX, 0.42, angle_color, 1)
 
-        vel_color = (0, 0, 255) if self.descent_velocity > 1.3 else (0, 255, 180)
-        cv2.putText(hud, f"• Descent Velocity (Vy): {self.descent_velocity:.2f} m/s",
-                    (kx + 10, ky + 68), cv2.FONT_HERSHEY_SIMPLEX, 0.42, vel_color, 1)
+            vel_color = (0, 0, 255) if self.descent_velocity > 1.3 else (0, 255, 180)
+            cv2.putText(hud, f"• Descent Velocity (Vy): {self.descent_velocity:.2f} m/s",
+                        (kx + 10, ky + 68), cv2.FONT_HERSHEY_SIMPLEX, 0.42, vel_color, 1)
 
-        aspect_color = (0, 0, 255) if self.aspect_ratio < 0.85 else (0, 255, 180)
-        cv2.putText(hud, f"• Aspect Ratio (H/W): {self.aspect_ratio:.2f} {'(COLLAPSED)' if self.aspect_ratio < 0.85 else '(UPRIGHT)'}",
-                    (kx + 10, ky + 91), cv2.FONT_HERSHEY_SIMPLEX, 0.42, aspect_color, 1)
+            aspect_color = (0, 0, 255) if self.aspect_ratio < 0.85 else (0, 255, 180)
+            cv2.putText(hud, f"• Aspect Ratio (H/W): {self.aspect_ratio:.2f} {'(COLLAPSED)' if self.aspect_ratio < 0.85 else '(UPRIGHT)'}",
+                        (kx + 10, ky + 91), cv2.FONT_HERSHEY_SIMPLEX, 0.42, aspect_color, 1)
 
-        cv2.putText(hud, f"• Floor Proximity: {self.floor_proximity:.2f}",
-                    (kx + 10, ky + 114), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 210, 220), 1)
+            cv2.putText(hud, f"• Floor Proximity: {self.floor_proximity:.2f}",
+                        (kx + 10, ky + 114), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 210, 220), 1)
+        else:
+            cv2.putText(hud, "• Fall Detection Engine: DISABLED",
+                        (kx + 10, ky + 48), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 150, 160), 1)
+            cv2.putText(hud, "• Kinematic calculations bypassed",
+                        (kx + 10, ky + 72), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (140, 150, 160), 1)
+            cv2.putText(hud, "• Toggle ON in Quick Controls panel",
+                        (kx + 10, ky + 96), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 240, 255), 1)
 
-        # 8. Active Alert Banner
+        # 8. Real-Time IoT Sensor Telemetry Overlay (Bottom Right)
+        iot_w, iot_h = 285, 110
+        ix, iy = w - iot_w - 16, h - iot_h - 16
+        overlay = hud.copy()
+        cv2.rectangle(overlay, (ix, iy), (ix + iot_w, iy + iot_h), (12, 16, 24), -1)
+        cv2.addWeighted(overlay, 0.85, hud, 0.15, 0, hud)
+        cv2.rectangle(hud, (ix, iy), (ix + iot_w, iy + iot_h), (0, 240, 255), 1)
+
+        cv2.putText(hud, "📡 ESP32 IOT SENSORS", (ix + 10, iy + 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 240, 255), 1)
+
+        pir_act = self.esp32_sensor_readings.get("pir_motion", False)
+        pir_armed = self.feature_toggles.get("esp32_pir", True)
+        pir_txt = ("🚨 MOTION" if pir_act else "IDLE") if pir_armed else "DISABLED"
+        pir_col = (0, 0, 255) if (pir_act and pir_armed) else ((0, 255, 160) if pir_armed else (120, 130, 140))
+        cv2.putText(hud, f"• PIR Motion: {pir_txt}", (ix + 10, iy + 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, pir_col, 1)
+
+        dist_armed = self.feature_toggles.get("esp32_ultrasonic", True)
+        dist_val = self.esp32_sensor_readings.get("distance_cm", 0.0)
+        dist_str = (f"{dist_val:.1f} cm" if dist_val > 0 else "--- cm") if dist_armed else "DISABLED"
+        cv2.putText(hud, f"• Distance: {dist_str}", (ix + 10, iy + 64),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (200, 220, 240) if dist_armed else (120, 130, 140), 1)
+
+        d1_armed = self.feature_toggles.get("esp32_door1", True)
+        d2_armed = self.feature_toggles.get("esp32_door2", True)
+        d1_act = self.esp32_sensor_readings.get("door1_open", False)
+        d2_act = self.esp32_sensor_readings.get("door2_open", False)
+        d1_str = ("OPEN" if d1_act else "CLOSED") if d1_armed else "OFF"
+        d2_str = ("OPEN" if d2_act else "CLOSED") if d2_armed else "OFF"
+        door_col = (0, 0, 255) if ((d1_act and d1_armed) or (d2_act and d2_armed)) else (0, 255, 160)
+        cv2.putText(hud, f"• Doors: Front[{d1_str}] Back[{d2_str}]", (ix + 10, iy + 86),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, door_col, 1)
+
+        # 9. Active Alert Banner
         if time.time() < self.alert_expiry:
             banner_y = h - 62
             overlay = hud.copy()
@@ -1265,9 +1576,44 @@ class LiveAIMonitor:
             else:
                 frame = self.generate_synthetic_frame()
 
-            ai_start = time.time()
-            detections = self.detector.detect(frame)
-            self.update_tracks(detections)
+            if not self.feature_toggles.get("object_detection", True):
+                # Completely skip DNN inference (near 0% compute)
+                detections = []
+                stale_ids = list(self.tracks.keys())
+                for tid in stale_ids:
+                    del self.tracks[tid]
+                self.person_count = 0
+                self.is_fall_active = False
+                self.is_intrusion_active = False
+                ai_latency = 0.0
+            else:
+                ai_start = time.time()
+                skeletal_enabled = self.feature_toggles.get("skeletal_tracking", True)
+                detections = self.detector.detect(frame, skeletal_tracking_enabled=skeletal_enabled)
+
+                # If synthetic frame and no detections, provide synthetic person with keypoints
+                if self.stream_source == "synthetic" and not detections:
+                    t_now = time.time()
+                    px = 0.50 + 0.30 * np.sin(t_now * 0.5)
+                    py = 0.52 + 0.10 * np.cos(t_now * 0.8)
+                    cx, cy = int(px * 1280), int(py * 720)
+                    synth_bbox = (
+                        max(0.0, (cx - 36) / 1280.0),
+                        max(0.0, (cy - 120) / 720.0),
+                        min(1.0, (cx + 36) / 1280.0),
+                        min(1.0, (cy + 100) / 720.0)
+                    )
+                    synth_kp = self.detector._estimate_skeletal_keypoints(synth_bbox) if skeletal_enabled else None
+                    detections = [DetectionObject(
+                        bbox=synth_bbox,
+                        confidence=0.92,
+                        class_id=0,
+                        class_name="person",
+                        keypoints=synth_kp
+                    )]
+
+                self.update_tracks(detections)
+                ai_latency = (time.time() - ai_start) * 1000.0
 
             h, w = frame.shape[:2]
             detections_for_zones = []
@@ -1308,7 +1654,6 @@ class LiveAIMonitor:
                         self.trigger_alert(f"RESTRICTED AREA '{zone_name}' BREACHED by Track #{track_id_val}!", "INTRUSION")
                         self.record_15s_incident_clip("INTRUSION")
 
-            ai_latency = (time.time() - ai_start) * 1000.0
             self.recent_latencies.append(ai_latency)
             if len(self.recent_latencies) > 30:
                 self.recent_latencies.pop(0)
@@ -1338,7 +1683,7 @@ class LiveAIMonitor:
 # Embedded Web HUD Server & REST API
 # ==============================================================================
 def create_web_hud_app(monitor: LiveAIMonitor):
-    from fastapi import FastAPI
+    from fastapi import FastAPI, Request
     from fastapi.responses import HTMLResponse, StreamingResponse
     from fastapi.middleware.cors import CORSMiddleware
     from pydantic import BaseModel
@@ -1598,6 +1943,132 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     }
     .event-fall { border-left-color: var(--accent-red); color: #ff99bb; }
     .event-intrusion { border-left-color: var(--accent-orange); color: #ffd280; }
+    /* Quick Controls & Animated Switches */
+    .control-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 7px 10px;
+      background: rgba(0,0,0,0.30);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 8px;
+    }
+    .control-label-group {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .control-title {
+      font-size: 11.5px;
+      font-weight: 700;
+      color: #fff;
+    }
+    .control-desc {
+      font-size: 9.5px;
+      color: var(--text-dim);
+    }
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 42px;
+      height: 22px;
+      flex-shrink: 0;
+    }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background-color: #21262d;
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      border-radius: 22px;
+      border: 1px solid rgba(255,255,255,0.2);
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 14px;
+      width: 14px;
+      left: 3px;
+      bottom: 3px;
+      background-color: #8b949e;
+      transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+      border-radius: 50%;
+    }
+    input:checked + .slider {
+      background-color: rgba(0, 240, 255, 0.25);
+      border-color: var(--accent-cyan);
+      box-shadow: 0 0 8px rgba(0, 240, 255, 0.4);
+    }
+    input:checked + .slider:before {
+      transform: translateX(20px);
+      background-color: var(--accent-cyan);
+      box-shadow: 0 0 6px var(--accent-cyan);
+    }
+    .switch-sm { width: 34px; height: 18px; }
+    .switch-sm .slider:before { height: 12px; width: 12px; left: 2px; bottom: 2px; }
+    .switch-sm input:checked + .slider:before { transform: translateX(16px); }
+
+    /* IoT Sensor Grid & Telemetry Badges */
+    .sensor-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 7px;
+      margin-top: 6px;
+    }
+    .sensor-card {
+      background: rgba(0,0,0,0.30);
+      border: 1px solid rgba(255,255,255,0.07);
+      border-radius: 8px;
+      padding: 7px 9px;
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .sensor-title-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .sensor-name {
+      font-size: 11px;
+      font-weight: 700;
+      color: #e6edf3;
+    }
+    .sensor-badge {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 9.5px;
+      font-weight: 700;
+      padding: 2px 6px;
+      border-radius: 4px;
+      background: rgba(0, 240, 255, 0.15);
+      border: 1px solid var(--accent-cyan);
+      color: var(--accent-cyan);
+      text-transform: uppercase;
+      transition: all 0.2s ease;
+    }
+    .sensor-badge.idle {
+      background: rgba(0, 255, 157, 0.12);
+      border-color: rgba(0, 255, 157, 0.4);
+      color: var(--accent-green);
+    }
+    .sensor-badge.alert {
+      background: rgba(255, 0, 85, 0.25);
+      border-color: var(--accent-red);
+      color: #ff99bb;
+      animation: pulseAlert 1.2s infinite alternate;
+    }
+    @keyframes pulseAlert {
+      from { box-shadow: 0 0 2px rgba(255,0,85,0.4); }
+      to { box-shadow: 0 0 10px rgba(255,0,85,0.8); }
+    }
+    .sensor-controls-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding-top: 4px;
+      border-top: 1px solid rgba(255,255,255,0.05);
+    }
     .toast {
       position: fixed;
       bottom: 20px;
@@ -1672,6 +2143,127 @@ def create_web_hud_app(monitor: LiveAIMonitor):
     </div>
 
     <div>
+      <!-- ⚡ AI & IoT Quick Controls Panel -->
+      <div class="card">
+        <div class="card-title">
+          <span>⚡ AI & IoT Quick Controls</span>
+          <span class="badge" style="font-size: 10px; padding: 2px 7px;" id="aiModeBadge">LIVE SYNC</span>
+        </div>
+
+        <!-- AI Engine Feature Toggles -->
+        <div style="display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px;">
+          <!-- Fall Detection Toggle -->
+          <div class="control-row">
+            <div class="control-label-group">
+              <span class="control-title">🏃 Fall Detection</span>
+              <span class="control-desc">Kinematic descent & immobility monitor</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="toggle_fall_detection" onchange="onToggleFeature('fall_detection', this.checked)" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <!-- Skeletal Tracking Toggle -->
+          <div class="control-row">
+            <div class="control-label-group">
+              <span class="control-title">🦴 Skeletal Tracking</span>
+              <span class="control-desc">17-Keypoint joint limb overlay</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="toggle_skeletal_tracking" onchange="onToggleFeature('skeletal_tracking', this.checked)" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <!-- Multi-Class Object Detection Toggle -->
+          <div class="control-row">
+            <div class="control-label-group">
+              <span class="control-title">👁️ Multi-Class Object Detection</span>
+              <span class="control-desc">YOLO DNN (Standby = 0% compute)</span>
+            </div>
+            <label class="switch">
+              <input type="checkbox" id="toggle_object_detection" onchange="onToggleFeature('object_detection', this.checked)" checked>
+              <span class="slider"></span>
+            </label>
+          </div>
+        </div>
+
+        <!-- ESP32 IoT Hardware Telemetry & Controls -->
+        <div style="border-top: 1px solid rgba(255,255,255,0.08); padding-top: 10px;">
+          <div style="font-size: 11px; font-weight: 700; color: var(--accent-cyan); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center;">
+            <span>📡 ESP32 Hardware Telemetry</span>
+            <span style="font-size: 10px; color: var(--text-dim); font-family: 'JetBrains Mono', monospace;">Port :8080</span>
+          </div>
+
+          <div class="sensor-grid">
+            <!-- PIR Motion Sensor -->
+            <div class="sensor-card">
+              <div class="sensor-title-row">
+                <span class="sensor-name">🚶 PIR Motion</span>
+                <span class="sensor-badge idle" id="pirStatusBadge">IDLE</span>
+              </div>
+              <div class="sensor-controls-row">
+                <span style="color: var(--text-dim); font-size: 10px;">Armed:</span>
+                <label class="switch switch-sm">
+                  <input type="checkbox" id="toggle_esp32_pir" onchange="onToggleFeature('esp32_pir', this.checked)" checked>
+                  <span class="slider"></span>
+                </label>
+                <button class="btn btn-sm" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('pir')">Simulate</button>
+              </div>
+            </div>
+
+            <!-- Ultrasonic Sensor -->
+            <div class="sensor-card">
+              <div class="sensor-title-row">
+                <span class="sensor-name">📏 Ultrasonic</span>
+                <span class="sensor-badge" id="distStatusBadge">--- cm</span>
+              </div>
+              <div class="sensor-controls-row">
+                <span style="color: var(--text-dim); font-size: 10px;">Armed:</span>
+                <label class="switch switch-sm">
+                  <input type="checkbox" id="toggle_esp32_ultrasonic" onchange="onToggleFeature('esp32_ultrasonic', this.checked)" checked>
+                  <span class="slider"></span>
+                </label>
+                <button class="btn btn-sm" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('dist')">Ping</button>
+              </div>
+            </div>
+
+            <!-- Door 1 Sensor -->
+            <div class="sensor-card">
+              <div class="sensor-title-row">
+                <span class="sensor-name">🚪 Door 1 (Front)</span>
+                <span class="sensor-badge idle" id="door1StatusBadge">CLOSED</span>
+              </div>
+              <div class="sensor-controls-row">
+                <span style="color: var(--text-dim); font-size: 10px;">Armed:</span>
+                <label class="switch switch-sm">
+                  <input type="checkbox" id="toggle_esp32_door1" onchange="onToggleFeature('esp32_door1', this.checked)" checked>
+                  <span class="slider"></span>
+                </label>
+                <button class="btn btn-sm" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('door1')">Toggle</button>
+              </div>
+            </div>
+
+            <!-- Door 2 Sensor -->
+            <div class="sensor-card">
+              <div class="sensor-title-row">
+                <span class="sensor-name">🚪 Door 2 (Back)</span>
+                <span class="sensor-badge idle" id="door2StatusBadge">CLOSED</span>
+              </div>
+              <div class="sensor-controls-row">
+                <span style="color: var(--text-dim); font-size: 10px;">Armed:</span>
+                <label class="switch switch-sm">
+                  <input type="checkbox" id="toggle_esp32_door2" onchange="onToggleFeature('esp32_door2', this.checked)" checked>
+                  <span class="slider"></span>
+                </label>
+                <button class="btn btn-sm" style="font-size: 9.5px; padding: 2px 6px;" onclick="simulateSensor('door2')">Toggle</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- Multi-Zone Manager Panel -->
       <div class="card">
         <div class="card-title">
@@ -2051,6 +2643,58 @@ def create_web_hud_app(monitor: LiveAIMonitor):
       } catch (e) { showToast('Camera scan failed.'); }
     }
 
+    let isUserToggling = false;
+
+    async function onToggleFeature(feature, enabled) {
+      isUserToggling = true;
+      try {
+        const res = await fetch('/api/toggles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ feature: feature, enabled: enabled })
+        });
+        const data = await res.json();
+        showToast(`Feature '${feature}' -> ${enabled ? 'ON' : 'OFF'}`);
+      } catch (e) {
+        showToast('Failed to update toggle');
+      } finally {
+        setTimeout(() => { isUserToggling = false; }, 600);
+      }
+    }
+
+    async function simulateSensor(type) {
+      let payload = {};
+      if (type === 'pir') {
+        payload = { pir_motion: true };
+        setTimeout(() => {
+          fetch('/api/sensors/esp32', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ pir_motion: false })
+          });
+        }, 3500);
+      } else if (type === 'dist') {
+        const d = (Math.random() * 120 + 20).toFixed(1);
+        payload = { distance_cm: parseFloat(d) };
+      } else if (type === 'door1') {
+        const curr = document.getElementById('door1StatusBadge').textContent.trim() === 'OPEN';
+        payload = { door1_open: !curr };
+      } else if (type === 'door2') {
+        const curr = document.getElementById('door2StatusBadge').textContent.trim() === 'OPEN';
+        payload = { door2_open: !curr };
+      }
+      try {
+        await fetch('/api/sensors/esp32', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        showToast(`Simulated sensor: ${type}`);
+      } catch (e) {
+        showToast('Failed to simulate sensor');
+      }
+    }
+
     async function updateTelemetry() {
       try {
         const res = await fetch('/api/status');
@@ -2069,8 +2713,88 @@ def create_web_hud_app(monitor: LiveAIMonitor):
           fallStatus.textContent = '🚨 FALL DETECTED!';
           fallStatus.style.color = 'var(--accent-red)';
         } else {
-          fallStatus.textContent = 'NORMAL';
-          fallStatus.style.color = 'var(--accent-green)';
+          fallStatus.textContent = data.feature_toggles && !data.feature_toggles.fall_detection ? 'DISABLED' : 'NORMAL';
+          fallStatus.style.color = data.feature_toggles && !data.feature_toggles.fall_detection ? 'var(--text-dim)' : 'var(--accent-green)';
+        }
+
+        // Sync Feature Toggles (when user is not clicking)
+        if (!isUserToggling && data.feature_toggles) {
+          const ft = data.feature_toggles;
+          for (const [key, val] of Object.entries(ft)) {
+            const el = document.getElementById(`toggle_${key}`);
+            if (el && el.checked !== val) {
+              el.checked = val;
+            }
+          }
+          const modeBadge = document.getElementById('aiModeBadge');
+          if (modeBadge) {
+            if (!ft.object_detection) {
+              modeBadge.textContent = 'STANDBY 0%';
+              modeBadge.style.borderColor = 'var(--text-dim)';
+              modeBadge.style.color = 'var(--text-dim)';
+            } else if (ft.skeletal_tracking) {
+              modeBadge.textContent = 'POSE + DET';
+              modeBadge.style.borderColor = 'var(--accent-cyan)';
+              modeBadge.style.color = 'var(--accent-cyan)';
+            } else {
+              modeBadge.textContent = 'DET ONLY';
+              modeBadge.style.borderColor = 'var(--accent-green)';
+              modeBadge.style.color = 'var(--accent-green)';
+            }
+          }
+        }
+
+        // Sync ESP32 Sensor Telemetry Badges
+        if (data.esp32_sensor_readings) {
+          const s = data.esp32_sensor_readings;
+
+          // PIR Motion
+          const pirBadge = document.getElementById('pirStatusBadge');
+          if (pirBadge) {
+            if (s.pir_motion) {
+              pirBadge.textContent = '🚨 MOTION';
+              pirBadge.className = 'sensor-badge alert';
+            } else {
+              pirBadge.textContent = 'IDLE';
+              pirBadge.className = 'sensor-badge idle';
+            }
+          }
+
+          // Ultrasonic Distance
+          const distBadge = document.getElementById('distStatusBadge');
+          if (distBadge) {
+            if (s.distance_cm && s.distance_cm > 0) {
+              distBadge.textContent = `${s.distance_cm.toFixed(1)} cm`;
+              distBadge.className = 'sensor-badge';
+            } else {
+              distBadge.textContent = '--- cm';
+              distBadge.className = 'sensor-badge idle';
+            }
+          }
+
+          // Door 1
+          const d1Badge = document.getElementById('door1StatusBadge');
+          if (d1Badge) {
+            if (s.door1_open) {
+              d1Badge.textContent = 'OPEN';
+              d1Badge.className = 'sensor-badge alert';
+            } else {
+              d1Badge.textContent = 'CLOSED';
+              d1Badge.className = 'sensor-badge idle';
+            }
+          }
+
+          // Door 2
+          const d2Badge = document.getElementById('door2StatusBadge');
+          if (d2Badge) {
+            if (s.door2_open) {
+              d2Badge.textContent = 'OPEN';
+              d2Badge.className = 'sensor-badge alert';
+            } else {
+              d2Badge.textContent = 'CLOSED';
+              d2Badge.className = 'sensor-badge idle';
+            }
+          }
         }
 
         if (data.events && data.events.length > 0) {
@@ -2127,7 +2851,95 @@ def create_web_hud_app(monitor: LiveAIMonitor):
             "aspect_ratio": monitor.aspect_ratio,
             "floor_proximity": monitor.floor_proximity,
             "is_fall_active": monitor.is_fall_active,
+            "feature_toggles": monitor.feature_toggles,
+            "esp32_sensor_readings": monitor.esp32_sensor_readings,
             "events": recent_events
+        }
+
+    @web_app.get("/api/toggles")
+    async def get_toggles():
+        return {
+            "status": "ok",
+            "feature_toggles": monitor.feature_toggles,
+            "esp32_sensor_readings": monitor.esp32_sensor_readings
+        }
+
+    @web_app.post("/api/toggles")
+    async def update_toggles(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+
+        updated = {}
+        if "feature" in data and "enabled" in data:
+            feat = str(data["feature"])
+            val = bool(data["enabled"])
+            if feat in monitor.feature_toggles:
+                monitor.feature_toggles[feat] = val
+                updated[feat] = val
+        elif "toggles" in data and isinstance(data["toggles"], dict):
+            for k, v in data["toggles"].items():
+                if k in monitor.feature_toggles:
+                    monitor.feature_toggles[k] = bool(v)
+                    updated[k] = bool(v)
+        else:
+            for k, v in data.items():
+                if k in monitor.feature_toggles and isinstance(v, bool):
+                    monitor.feature_toggles[k] = v
+                    updated[k] = v
+
+        return {
+            "status": "ok",
+            "updated": updated,
+            "feature_toggles": monitor.feature_toggles
+        }
+
+    @web_app.post("/api/sensors/esp32")
+    async def ingest_esp32_telemetry(request: Request):
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+
+        # 1. PIR Motion
+        if "pir_motion" in data:
+            monitor.esp32_sensor_readings["pir_motion"] = bool(data["pir_motion"])
+        elif "pir" in data:
+            monitor.esp32_sensor_readings["pir_motion"] = bool(data["pir"])
+
+        # 2. Ultrasonic Distance
+        if "distance_cm" in data:
+            monitor.esp32_sensor_readings["distance_cm"] = float(data["distance_cm"])
+        elif "distance" in data:
+            monitor.esp32_sensor_readings["distance_cm"] = float(data["distance"])
+
+        # 3. Door 1
+        if "door1_open" in data:
+            monitor.esp32_sensor_readings["door1_open"] = bool(data["door1_open"])
+        elif "door1" in data:
+            monitor.esp32_sensor_readings["door1_open"] = bool(data["door1"])
+
+        # 4. Door 2
+        if "door2_open" in data:
+            monitor.esp32_sensor_readings["door2_open"] = bool(data["door2_open"])
+        elif "door2" in data:
+            monitor.esp32_sensor_readings["door2_open"] = bool(data["door2"])
+
+        # Alert dispatches if respective sensor toggle is enabled
+        if monitor.feature_toggles.get("esp32_pir", True) and monitor.esp32_sensor_readings["pir_motion"]:
+            monitor.trigger_alert("🚶 ESP32 PIR Hardware Motion Detected!", "PIR_MOTION", duration=3.0)
+
+        if monitor.feature_toggles.get("esp32_door1", True) and monitor.esp32_sensor_readings["door1_open"]:
+            monitor.trigger_alert("🚪 Door 1 (Front Entrance) Breach / Open!", "DOOR_OPEN", duration=3.0)
+
+        if monitor.feature_toggles.get("esp32_door2", True) and monitor.esp32_sensor_readings["door2_open"]:
+            monitor.trigger_alert("🚪 Door 2 (Back Exit) Breach / Open!", "DOOR_OPEN", duration=3.0)
+
+        return {
+            "status": "ok",
+            "esp32_sensor_readings": monitor.esp32_sensor_readings,
+            "feature_toggles": monitor.feature_toggles
         }
 
     @web_app.get("/api/zones")
@@ -2207,11 +3019,19 @@ def main():
     parser = argparse.ArgumentParser(description="Edge AI CCTV Live AI Monitor & Multi-Zone Evaluator")
     parser.add_argument("--stream", type=str, default=None,
                         help="Stream URL of ESP32 / IP Camera (e.g. http://10.68.21.86:81/stream)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Path to YOLO ONNX detection model (yolo11n.onnx, yolov8n.onnx, yolov5n.onnx)")
+    parser.add_argument("--pose-model", type=str, default=None,
+                        help="Path to YOLO Pose ONNX model (yolo11n-pose.onnx, yolov8n-pose.onnx)")
     parser.add_argument("--port", type=int, default=8080, help="Web HUD port (default 8080)")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open browser")
     args = parser.parse_args()
 
-    monitor = LiveAIMonitor(args.stream)
+    monitor = LiveAIMonitor(
+        initial_stream=args.stream,
+        model_path=args.model,
+        pose_model_path=args.pose_model
+    )
 
     capture_thread = threading.Thread(target=monitor.capture_frame_loop, daemon=True)
     capture_thread.start()

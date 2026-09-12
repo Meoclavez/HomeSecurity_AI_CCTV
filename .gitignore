@@ -27,10 +27,12 @@ htmlcov/
 edge_backend/storage/*.db
 edge_backend/storage/*.db-journal
 edge_backend/storage/*.db-wal
+edge_backend/storage/*.db-shm
 edge_backend/storage/clips/*.mp4
 edge_backend/storage/snapshots/*.jpg
 edge_backend/storage/dvr/*
 edge_backend/storage/archives/*
+edge_backend/storage/logs/*
 *.log
 
 # TLS / Certificates (Secrets)
@@ -74,6 +76,7 @@ mobile_app/ios/**/.symlinks/
 mobile_app/ios/**/profile
 mobile_app/ios/**/xcuserdata
 mobile_app/ios/.generated/
+mobile_app/ios/Flutter/ephemeral/
 mobile_app/ios/Flutter/App.framework
 mobile_app/ios/Flutter/Flutter.framework
 mobile_app/ios/Flutter/Flutter.podspec

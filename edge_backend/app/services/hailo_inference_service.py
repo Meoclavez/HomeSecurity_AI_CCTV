@@ -22,6 +22,7 @@ from app.models.schemas import (
     Keypoint,
     KinematicMetrics,
 )
+from app.services.feature_manager import feature_manager, FeatureManager
 
 logger = logging.getLogger("HailoInferenceService")
 
@@ -97,6 +98,11 @@ class KinematicFallEngine:
         keypoints: List[Keypoint],
         bbox: BoundingBox
     ) -> Optional[Tuple[EventType, EventSeverity, float, KinematicMetrics]]:
+        features = feature_manager.get_features(camera_id)
+        if not features.fall_detection_enabled:
+            logger.debug(f"Fall detection disabled for camera {camera_id}; bypassing kinematics.")
+            return None
+
         now = time.time()
 
         # 1. Evict stale tracks older than 10s to prevent unbounded memory growth
@@ -206,14 +212,78 @@ class HailoInferenceService:
     def is_simulated(self) -> bool:
         return not self.device_available
 
+    def detect_objects(
+        self,
+        camera_id: str,
+        frame: np.ndarray,
+        raw_detections: Optional[List[BoundingBox]] = None
+    ) -> List[BoundingBox]:
+        """Detect objects, bypassing if object_detection_enabled is False."""
+        features = feature_manager.get_features(camera_id)
+        if not features.object_detection_enabled:
+            logger.debug(f"Object detection disabled for camera {camera_id}; bypassing detection.")
+            return []
+
+        candidates = raw_detections if raw_detections is not None else []
+        filtered: List[BoundingBox] = []
+        for det in candidates:
+            lbl = det.label.lower()
+            if lbl == "package" and not features.package_detection_enabled:
+                continue
+            if lbl in ("dog", "cat", "bird", "animal") and not features.animal_detection_enabled:
+                continue
+            if lbl in ("car", "truck", "bus", "motorcycle", "vehicle") and not features.vehicle_detection_enabled:
+                continue
+            filtered.append(det)
+
+        return filtered
+
+    def detect_pose(
+        self,
+        camera_id: str,
+        frame: np.ndarray,
+        raw_keypoints: Optional[List[Keypoint]] = None
+    ) -> List[Keypoint]:
+        """Extract skeletal keypoints, bypassing if skeletal_tracking_enabled is False."""
+        features = feature_manager.get_features(camera_id)
+        if not features.skeletal_tracking_enabled:
+            logger.debug(f"Skeletal tracking disabled for camera {camera_id}; bypassing pose keypoints.")
+            return []
+
+        return raw_keypoints if raw_keypoints is not None else []
+
+    def run_kinematics(
+        self,
+        camera_id: str,
+        track_id: int,
+        keypoints: List[Keypoint],
+        bbox: BoundingBox
+    ) -> Optional[Tuple[EventType, EventSeverity, float, KinematicMetrics]]:
+        """Run kinematics state machine, bypassing if fall_detection_enabled is False."""
+        features = feature_manager.get_features(camera_id)
+        if not features.fall_detection_enabled:
+            logger.debug(f"Fall detection disabled for camera {camera_id}; bypassing kinematics.")
+            return None
+
+        return self.kinematic_engine.analyze_pose(camera_id, track_id, keypoints, bbox)
+
     def process_frame(
         self,
         camera_id: str,
         frame: np.ndarray,
-        track_id: int = 1
+        track_id: int = 1,
+        simulated_detections: Optional[List[BoundingBox]] = None,
+        simulated_keypoints: Optional[List[Keypoint]] = None
     ) -> List[SecurityEventCreate]:
         from app.services.resilience import CircuitBreaker, ServiceHealthTracker
         
+        features = feature_manager.get_features(camera_id)
+
+        # 1. Bypass detection entirely if disabled
+        if not features.object_detection_enabled:
+            logger.debug(f"Object detection disabled for {camera_id}; bypassing detection pipeline.")
+            return []
+
         # Simple watchdog
         now = time.time()
         if now - self.last_inference_time > 30.0:
@@ -232,10 +302,8 @@ class HailoInferenceService:
             if not self._circuit_breaker.can_execute():
                 logger.warning("Hailo circuit OPEN, falling back to CPU simulated mode.")
                 ServiceHealthTracker.report_status("hailo_inference", "degraded", "Circuit OPEN, using CPU fallback")
-                # CPU Fallback would go here
             else:
                 try:
-                    # Simulated Hailo execution
                     pass
                     self._circuit_breaker.record_success()
                 except Exception as e:
@@ -246,8 +314,6 @@ class HailoInferenceService:
             # Metrics and latency tracking
             latency_ms = (time.time() - start_time) * 1000
             self.latency_history.append((now, latency_ms))
-            
-            # Keep 1-minute window
             self.latency_history = [(t, l) for t, l in self.latency_history if now - t <= 60.0]
             
             if self.latency_history:
@@ -263,7 +329,38 @@ class HailoInferenceService:
         except Exception as e:
             logger.error(f"Inference error: {e}")
 
+        # 2. Object Detection
+        detections = self.detect_objects(camera_id, frame, raw_detections=simulated_detections)
+
+        # 3. Skeletal Tracking & Pose Keypoints
+        if not features.skeletal_tracking_enabled:
+            logger.debug(f"Skeletal tracking disabled for {camera_id}; bypassing pose keypoints.")
+            keypoints = []
+        else:
+            keypoints = self.detect_pose(camera_id, frame, raw_keypoints=simulated_keypoints)
+
+        # 4. Kinematic Fall Detection State Machine
         events: List[SecurityEventCreate] = []
+        if not features.fall_detection_enabled:
+            logger.debug(f"Fall detection disabled for {camera_id}; bypassing kinematics state machine.")
+        elif keypoints:
+            for det in detections:
+                if det.label == "person":
+                    fall_result = self.run_kinematics(camera_id, track_id, keypoints, det)
+                    if fall_result:
+                        evt_type, sev, conf, kin = fall_result
+                        events.append(
+                            SecurityEventCreate(
+                                camera_id=camera_id,
+                                event_type=evt_type,
+                                severity=sev,
+                                confidence=conf,
+                                bounding_box=det,
+                                keypoints=keypoints,
+                                kinematics=kin,
+                            )
+                        )
+
         return events
 
 

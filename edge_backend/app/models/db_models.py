@@ -32,16 +32,17 @@ class SystemSetupModel(Base):
 class CameraModel(Base):
     __tablename__ = "cameras"
 
-    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     location: Mapped[str] = mapped_column(String(128), nullable=False)
     rtsp_url: Mapped[str] = mapped_column(String(512), nullable=False)
-    webrtc_url: Mapped[str] = mapped_column(String(512), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="ONLINE")
+    webrtc_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    status: Mapped[str] = mapped_column(String(32), default="ONLINE", index=True)
     fps: Mapped[int] = mapped_column(Integer, default=30)
     resolution: Mapped[str] = mapped_column(String(32), default="1920x1080")
     is_ai_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     ai_models: Mapped[list] = mapped_column(JSON, default=list)
+    features: Mapped[Optional[dict]] = mapped_column(JSON, default=dict, nullable=True)
 
     # 24/7 DVR Configuration
     dvr_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -62,6 +63,9 @@ class CameraModel(Base):
     )
     archives: Mapped[list["IncidentArchiveModel"]] = relationship(
         "IncidentArchiveModel", back_populates="camera", cascade="all, delete-orphan"
+    )
+    sensor_nodes: Mapped[list["SensorNodeModel"]] = relationship(
+        "SensorNodeModel", back_populates="camera"
     )
 
 
@@ -137,4 +141,25 @@ class DeviceTokenModel(Base):
     device_name: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     app_version: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
     last_registered: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class SensorNodeModel(Base):
+    __tablename__ = "sensor_nodes"
+
+    id: Mapped[str] = mapped_column(String(64), primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    node_type: Mapped[str] = mapped_column(String(64), default="ESP32_SENTRY", index=True)
+    ip_address: Mapped[str] = mapped_column(String(64), nullable=False)
+    mac_address: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, unique=True, index=True)
+    associated_camera_id: Mapped[Optional[str]] = mapped_column(
+        String(64), ForeignKey("cameras.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    enabled_sensors: Mapped[Optional[dict]] = mapped_column(JSON, default=dict, nullable=True)
+    sensor_states: Mapped[Optional[dict]] = mapped_column(JSON, default=dict, nullable=True)
+    last_heartbeat: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    camera: Mapped[Optional["CameraModel"]] = relationship("CameraModel", back_populates="sensor_nodes")
+
 
